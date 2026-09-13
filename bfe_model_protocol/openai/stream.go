@@ -30,11 +30,14 @@ func (a *Adapter) IsStreamTerminal(ev utils.StreamEvent) bool {
 	return ev.Type == "message_stop" || strings.TrimSpace(ev.Data) == "[DONE]"
 }
 
-// IsFinalUsageEvent carries the legacy hard-coded final-usage check: the
-// Anthropic non-streaming top-level type "message", or a protocol-agnostic
-// final usage chunk (an OpenAI stream_options.include_usage chunk has no
-// top-level type). Without "message" the final usage of a non-streaming
-// Anthropic JSON body would never be recognized (issue #1364).
+// IsFinalUsageEvent carries the legacy hard-coded final-usage check: an
+// Anthropic message_delta event, the Anthropic non-streaming top-level type
+// "message", or a protocol-agnostic final usage chunk (an OpenAI
+// stream_options.include_usage chunk has no top-level type). Without
+// "message_delta" a cross-protocol stream (Bearer request detected as openai
+// while the backend answers with an Anthropic body) would lose the final
+// usage and be undercharged; without "message" the final usage of a
+// non-streaming Anthropic JSON body would never be recognized (issue #1364).
 func (a *Adapter) IsFinalUsageEvent(ev utils.StreamEvent) bool {
-	return ev.Type == "message" || ev.Type == ""
+	return ev.Type == "message_delta" || ev.Type == "message" || ev.Type == ""
 }
