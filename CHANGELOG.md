@@ -10,6 +10,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.8.7] - 2026-09-13
+
+### Added
+- Support Gemini protocol with adapter-based usage extraction and a three-stage cross-protocol usage fallback chain ([Pull #1366](https://github.com/bfenetworks/bfe/pull/1366))
+- Support responses/video_generation modes, image input token and output_cost_per_video billing ([Pull #1346](https://github.com/bfenetworks/bfe/pull/1346))
+- Support length-tier pricing (`input/output_cost_per_token_above_{200k,256k,272k,512k}_tokens`) and 1h-TTL cache write cost ([Pull #1365](https://github.com/bfenetworks/bfe/pull/1365))
+- Add `ai_cache_write_1h_tokens`, `ai_image_input_tokens` and `ai_video_count` access log fields ([Pull #1365](https://github.com/bfenetworks/bfe/pull/1365), [Pull #1346](https://github.com/bfenetworks/bfe/pull/1346))
+- Production-harden BFE/EPP ext-proc integration: inference-pool metadata, primary/backup EPP addresses with gRPC health check, failover hysteresis and circuit breaker, TLS/timeouts config, `/monitor/epp_metrics` observability ([Pull #1358](https://github.com/bfenetworks/bfe/pull/1358))
+
+### Changed
+- Converge AI protocol handling (auth injection, usage extraction, error normalization) into the `bfe_model_protocol` adapter layer ([Pull #1350](https://github.com/bfenetworks/bfe/pull/1350))
+- Keep model prices as float64 and convert per billing item to preserve 10-12 decimal price precision ([Pull #1360](https://github.com/bfenetworks/bfe/pull/1360))
+- Allow zero total_token quota plans and treat a missing Redis balance as exhausted ([Pull #1353](https://github.com/bfenetworks/bfe/pull/1353))
+- Add tzdata package to Dockerfile ([Pull #1347](https://github.com/bfenetworks/bfe/pull/1347))
+
+### Fixed
+- Fix fresh input token billing for Anthropic high cache hit ([Pull #1350](https://github.com/bfenetworks/bfe/pull/1350))
+- Fix three billing issues: cacheRead truncation, skip /count_tokens endpoint, duplicate deduction guard ([Pull #1346](https://github.com/bfenetworks/bfe/pull/1346))
+- Skip full-request estimation billing on client abort ([Pull #1351](https://github.com/bfenetworks/bfe/pull/1351))
+- Bill complete usage for cross-protocol non-streaming responses ([Pull #1362](https://github.com/bfenetworks/bfe/pull/1362))
+- Mask raw API Key in access log (authorization header, ai_route_rule_hits rule owner, ai_auth_hit_quota_plans) ([Pull #1356](https://github.com/bfenetworks/bfe/pull/1356))
+- Relocate client CA/CRL base dirs on tls_conf reload with path ([Pull #1355](https://github.com/bfenetworks/bfe/pull/1355))
+- Attach HttpResponse for internally-constructed responses to fix panic when mod_header rewrites them ([Pull #1358](https://github.com/bfenetworks/bfe/pull/1358))
+- Send :path/:method pseudo-headers in EPP ext_proc request so chat-completions payloads parse correctly ([Pull #1365](https://github.com/bfenetworks/bfe/pull/1365))
+- Make joinPath separator-aware on Windows ([Pull #1360](https://github.com/bfenetworks/bfe/pull/1360))
+
+
 ## [v1.8.6] - 2026-08-29
 
 ### Added
@@ -490,6 +517,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Flexible plugin framework to extend functionality. Based on the framework, developer can add new features rapidly
 - Detailed built-in metrics available for service status monitor
 
+[v1.8.7]: https://github.com/bfenetworks/bfe/compare/v1.8.6...v1.8.7
 [v1.8.6]: https://github.com/bfenetworks/bfe/compare/v1.8.5...v1.8.6
 [v1.8.5]: https://github.com/bfenetworks/bfe/compare/v1.8.4...v1.8.5
 [v1.8.4]: https://github.com/bfenetworks/bfe/compare/v1.8.3...v1.8.4

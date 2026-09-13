@@ -17,6 +17,7 @@ package mod_ai_token_auth
 import (
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/bfenetworks/go-lib/log"
@@ -28,6 +29,8 @@ import (
 	"github.com/bfenetworks/bfe/bfe_basic"
 	"github.com/bfenetworks/bfe/bfe_config/bfe_cluster_conf/cluster_conf"
 	"github.com/bfenetworks/bfe/bfe_http"
+	modelprotocol "github.com/bfenetworks/bfe/bfe_model_protocol"
+	"github.com/bfenetworks/bfe/bfe_model_protocol/utils"
 	"github.com/bfenetworks/bfe/bfe_module"
 	"github.com/bfenetworks/bfe/bfe_util/redis_client"
 )
@@ -112,42 +115,32 @@ func (m *ModuleAITokenAuth) matchTokenRule(req *bfe_basic.Request) bool {
 }
 
 func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
-	var used, prompt, completion, cacheRead, cacheWrite, audioInput, audioOutput, imageCount int64
-
-	used = gjson.GetBytes(data, "usage.total_tokens").Int()
-	prompt = gjson.GetBytes(data, "usage.prompt_tokens").Int()
-	completion = gjson.GetBytes(data, "usage.completion_tokens").Int()
-	cacheRead = gjson.GetBytes(data, "usage.cache_read_tokens").Int()
-	cacheWrite = gjson.GetBytes(data, "usage.cache_write_tokens").Int()
-	audioInput = gjson.GetBytes(data, "usage.audio_input_tokens").Int()
-	audioOutput = gjson.GetBytes(data, "usage.audio_output_tokens").Int()
-	imageCount = gjson.GetBytes(data, "usage.image_count").Int()
-	if imageCount == 0 {
-		imageCount = gjson.GetBytes(data, "data.#").Int()
+	// The protocol/auth style is identified per request before the response
+	// is processed (GetApiKey / DetectAuthStyle), so the adapter for
+	// aiMeta.AuthStyle carries the same usage chain the legacy all-chain
+	// extraction applied to this response.
+	fields := modelprotocol.Get(ctx.aiBasicInfo.AuthStyle).ExtractUsageFields(data)
+	if fields.UsedQuota == 0 && fields.PromptTokens == 0 && fields.CompletionTokens == 0 &&
+		fields.ImageCount == 0 && fields.VideoCount == 0 {
+		// Auth style / response format mismatch (e.g. a Bearer key detected
+		// as openai while the backend returns an Anthropic body): the
+		// single adapter parsed nothing. Fall back to the composed
+		// cross-protocol chain so the final usage is still recognized
+		// (issue #1364); otherwise UsedQuota stays 0, the final-usage mark
+		// is never set, and the request-finish guard would zero the usage.
+		fields = utils.ParseUsageFieldsCrossProtocol(data)
 	}
-
-	// DeepSeek fallback: prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens
-	if cacheRead == 0 {
-		cacheRead = gjson.GetBytes(data, "usage.prompt_cache_hit_tokens").Int()
-	}
-	if cacheRead == 0 {
-		cacheRead = gjson.GetBytes(data, "usage.prompt_tokens_details.cached_tokens").Int()
-	}
-
-	// Claude fallback: input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens
-	if prompt == 0 && completion == 0 {
-		prompt = gjson.GetBytes(data, "usage.input_tokens").Int()
-		completion = gjson.GetBytes(data, "usage.output_tokens").Int()
-		if cacheRead == 0 {
-			cacheRead = gjson.GetBytes(data, "usage.cache_read_input_tokens").Int()
-		}
-		if cacheWrite == 0 {
-			cacheWrite = gjson.GetBytes(data, "usage.cache_creation_input_tokens").Int()
-		}
-		if used == 0 {
-			used = prompt + completion
-		}
-	}
+	used := fields.UsedQuota
+	prompt := fields.PromptTokens
+	completion := fields.CompletionTokens
+	cacheRead := fields.CacheReadTokens
+	cacheWrite := fields.CacheWriteTokens
+	cacheWrite1h := fields.CacheWriteTokens1h
+	audioInput := fields.AudioInputTokens
+	audioOutput := fields.AudioOutputTokens
+	imageInput := fields.ImageInputTokens
+	imageCount := fields.ImageCount
+	videoCount := fields.VideoCount
 
 	tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
 	if used > 0 {
@@ -156,12 +149,17 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 		tokenUsage.CompletionTokens = completion
 		tokenUsage.CacheReadTokens = cacheRead
 		tokenUsage.CacheWriteTokens = cacheWrite
+		tokenUsage.CacheWriteTokens1h = cacheWrite1h
 		tokenUsage.AudioInputTokens = audioInput
 		tokenUsage.AudioOutputTokens = audioOutput
+		tokenUsage.ImageInputTokens = imageInput
 		tokenUsage.ImageCount = imageCount
-	} else if prompt > 0 || completion > 0 || imageCount > 0 {
+		tokenUsage.VideoCount = videoCount
+	} else if prompt > 0 || completion > 0 || imageCount > 0 || videoCount > 0 {
 		if imageCount > 0 {
 			tokenUsage.UsedQuota = imageCount
+		} else if videoCount > 0 {
+			tokenUsage.UsedQuota = videoCount
 		} else {
 			tokenUsage.UsedQuota = prompt + completion
 		}
@@ -169,9 +167,12 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 		tokenUsage.CompletionTokens = completion
 		tokenUsage.CacheReadTokens = cacheRead
 		tokenUsage.CacheWriteTokens = cacheWrite
+		tokenUsage.CacheWriteTokens1h = cacheWrite1h
 		tokenUsage.AudioInputTokens = audioInput
 		tokenUsage.AudioOutputTokens = audioOutput
+		tokenUsage.ImageInputTokens = imageInput
 		tokenUsage.ImageCount = imageCount
+		tokenUsage.VideoCount = videoCount
 	}
 }
 
@@ -182,9 +183,14 @@ func (m *ModuleAITokenAuth) tokenReadResponseHandler(req *bfe_basic.Request, res
 	}
 	tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
 	if res.StatusCode == bfe_http.StatusOK && res.ContentLength >= 0 {
+		// The full non-streaming body was read: the response is complete.
+		ctx.aiBasicInfo.MarkResponseCompleted()
 		if bodyAccessor, err := res.GetBodyAccessor(); err == nil {
 			body, _ := bodyAccessor.GetBytes()
 			UpdateCtxByUsage(ctx, body)
+		}
+		if tokenUsage.UsedQuota > 0 {
+			ctx.aiBasicInfo.MarkFinalUsageSeen()
 		}
 		if tokenUsage.UsedQuota <= 0 && ctx.aiBasicInfo.IsAllowEstimateToken() {
 			tokenUsage.CompletionTokens = int64(res.ContentLength) / 4                                         // estimate completion tokens
@@ -203,7 +209,21 @@ func CalcReqUsedQuota(req *bfe_basic.Request, promptTokens, completionTokens int
 	return promptTokens + completionTokens
 }
 
+// isClientAbortErr reports whether err is a client-side abort error:
+// the client reset/closed the connection or the response could not be
+// written to the client.
+func isClientAbortErr(err error) bool {
+	return err == bfe_basic.ErrClientWrite ||
+		err == bfe_basic.ErrClientClose ||
+		err == bfe_basic.ErrClientReset
+}
+
 func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, res *bfe_http.Response) int {
+	// Skip token-count endpoints which should never be billed.
+	if strings.Contains(req.HttpRequest.RequestURI, "/count_tokens") {
+		return bfe_module.BfeHandlerGoOn
+	}
+
 	if res == nil || res.StatusCode != bfe_http.StatusOK {
 		// only count used quota for successful requests
 		return bfe_module.BfeHandlerGoOn
@@ -214,8 +234,43 @@ func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, re
 		return bfe_module.BfeHandlerGoOn
 	}
 
+	// Prevent duplicate deduction when HandleRequestFinish is triggered more than once.
+	if ctx.deducted {
+		return bfe_module.BfeHandlerGoOn
+	}
+
+	// Client aborted (RST/close/write-fail) before the final usage was
+	// seen: never bill by full-request estimation (issue #1352).
+	aborted := isClientAbortErr(req.ErrCode)
+	if aborted && !ctx.aiBasicInfo.IsFinalUsageSeen() {
+		ctx.deducted = true
+		return bfe_module.BfeHandlerGoOn
+	}
+
 	tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
-	if tokenUsage.UsedQuota <= 0 && ctx.aiBasicInfo.IsAllowEstimateToken() {
+	// Values populated by EstimateToken (prompt tokens seeded from request
+	// size, completion tokens accumulated from response content) are only
+	// billable when the response completed normally. Reset them otherwise:
+	// calcCostUnits below bills from the token fields directly, so guarding
+	// UsedQuota alone is not enough. All billing fields must be cleared:
+	// leaving sub-token fields (cache/audio/image) behind would let
+	// calcCostUnits bill the survivors alone (issue #1364: an unrecognized
+	// final usage was reduced to CacheReadTokens and billed cache-read only).
+	estimateBillable := ctx.aiBasicInfo.IsAllowEstimateToken() && ctx.aiBasicInfo.IsResponseCompleted()
+	if !ctx.aiBasicInfo.IsFinalUsageSeen() && !estimateBillable {
+		tokenUsage.PromptTokens = 0
+		tokenUsage.CompletionTokens = 0
+		tokenUsage.CacheReadTokens = 0
+		tokenUsage.CacheWriteTokens = 0
+		tokenUsage.CacheWriteTokens1h = 0
+		tokenUsage.AudioInputTokens = 0
+		tokenUsage.AudioOutputTokens = 0
+		tokenUsage.ImageInputTokens = 0
+		tokenUsage.VideoCount = 0
+		tokenUsage.ImageCount = 0
+		tokenUsage.UsedQuota = 0
+	}
+	if tokenUsage.UsedQuota <= 0 && estimateBillable {
 		tokenUsage.UsedQuota = CalcReqUsedQuota(req, tokenUsage.PromptTokens, tokenUsage.CompletionTokens) // calculate used quota
 	}
 
@@ -250,21 +305,13 @@ func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, re
 		}
 	}
 
+	ctx.deducted = true
 	return bfe_module.BfeHandlerGoOn
 }
 
 func SetApiKey(req *bfe_http.Request, apiKey string, authStyle string) {
 	// set api key according to protocol/auth style
-	if apiKey == "" {
-		return
-	}
-
-	switch authStyle {
-	case bfe_basic.AuthStyleAnthropic:
-		req.Header.Set("x-api-key", apiKey)
-	default:
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
-	}
+	_ = modelprotocol.Get(authStyle).InjectAuth(req, apiKey)
 }
 
 func GetApiKey(req *bfe_basic.Request) string {
@@ -391,6 +438,10 @@ type TokenAuthContext struct {
 	// serverConf caches the SvrDataConf before it is cleared by the reverse proxy.
 	// It is used for RMB cost calculation at request finish time.
 	serverConf bfe_basic.ServerDataConfInterface
+	// deducted marks whether the quota/cost deduction has already been executed
+	// for this request, preventing duplicate charges when HandleRequestFinish is
+	// triggered multiple times.
+	deducted bool
 }
 
 const REQ_TOKEN_AUTH_CONTEXT = "tokenauth_ctx"
@@ -420,6 +471,21 @@ func GetImageCountFromReq(req *bfe_basic.Request) int64 {
 	return n
 }
 
+// GetVideoCountFromReq reads the request body "n" field for video generation requests.
+// It returns at least 1 to avoid under-billing when the field is missing or invalid.
+func GetVideoCountFromReq(req *bfe_basic.Request) int64 {
+	bodyAccessor, _ := req.HttpRequest.GetBodyAccessor()
+	if bodyAccessor == nil {
+		return 1
+	}
+	body, _ := bodyAccessor.GetBytes()
+	n := gjson.GetBytes(body, "n").Int()
+	if n <= 0 {
+		return 1
+	}
+	return n
+}
+
 // SetTokenAuthContext sets the token authentication context in the request
 func SetTokenAuthContext(req *bfe_basic.Request, tok *Token, promptToken int64, tags []bfe_basic.ApikeyTag) {
 	aiBasicInfo := req.GetAiBasicInfo()
@@ -430,6 +496,9 @@ func SetTokenAuthContext(req *bfe_basic.Request, tok *Token, promptToken int64, 
 		tusage.CompletionTokens = bfe_basic.COMPLETION_TOKENS_UNKNOWN // -1 - unknown
 		if aiBasicInfo.Mode == bfe_basic.ModeImageGeneration {
 			tusage.ImageCount = GetImageCountFromReq(req)
+		}
+		if aiBasicInfo.Mode == bfe_basic.ModeVideoGeneration {
+			tusage.VideoCount = GetVideoCountFromReq(req)
 		}
 		aiBasicInfo.ApikeyTags = tags
 	}
@@ -508,9 +577,29 @@ func (m *ModuleAITokenAuth) calcCostUnits(req *bfe_basic.Request, serverConf bfe
 	switch mode {
 	case bfe_basic.ModeImageGeneration:
 		return calcImageGenerationCost(entry, usage, tierName)
+	case bfe_basic.ModeVideoGeneration:
+		return calcVideoGenerationCost(entry, usage, tierName)
+	case bfe_basic.ModeResponses:
+		return calcResponsesCost(entry, usage, tierName)
 	default:
 		return calcChatCost(entry, usage, tierName)
 	}
+}
+
+func calcResponsesCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.TokenUsage, tierName string) int64 {
+	return calcChatCost(entry, usage, tierName)
+}
+
+func calcVideoGenerationCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.TokenUsage, tierName string) int64 {
+	videoCount := usage.VideoCount
+	if videoCount < 0 {
+		videoCount = 0
+	}
+
+	// Prices stay float64 (yuan per unit); quota.CalcCostUnits converts each
+	// billing item to a fixed-point integer with rounding, so prices with
+	// more than 8 decimal places keep their precision.
+	return quota.CalcCostUnits(videoCount, entry.GetPrice(tierName, cluster_conf.PriceOutputCostPerVideo))
 }
 
 func calcImageGenerationCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.TokenUsage, tierName string) int64 {
@@ -519,23 +608,12 @@ func calcImageGenerationCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.To
 		imageCount = 0
 	}
 
-	costPerImage := entry.GetPriceInt(tierName, cluster_conf.PriceOutputCostPerImageInt)
-	if costPerImage < 0 {
-		log.Logger.Warn("invalid model price for image generation model %s", entry.Model)
-		return 0
-	}
-
-	return imageCount * costPerImage
+	cost := quota.CalcCostUnits(imageCount, entry.GetPrice(tierName, cluster_conf.PriceOutputCostPerImage))
+	cost += quota.CalcCostUnits(usage.ImageInputTokens, entry.GetPrice(tierName, cluster_conf.PriceInputCostPerImageToken))
+	return cost
 }
 
 func calcChatCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.TokenUsage, tierName string) int64 {
-	inputCost := entry.GetPriceInt(tierName, cluster_conf.PriceInputCostPerTokenInt)
-	outputCost := entry.GetPriceInt(tierName, cluster_conf.PriceOutputCostPerTokenInt)
-	if inputCost < 0 || outputCost < 0 {
-		log.Logger.Warn("invalid model price for model %s", entry.Model)
-		return 0
-	}
-
 	promptTokens := usage.PromptTokens
 	completionTokens := usage.CompletionTokens
 	cacheReadTokens := usage.CacheReadTokens
@@ -547,17 +625,17 @@ func calcChatCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.TokenUsage, t
 	if cacheReadTokens < 0 {
 		cacheReadTokens = 0
 	}
-	if cacheReadTokens > promptTokens {
-		cacheReadTokens = promptTokens
-	}
 	if cacheWriteTokens < 0 {
 		cacheWriteTokens = 0
 	}
 	if audioInputTokens < 0 {
 		audioInputTokens = 0
 	}
-	if audioInputTokens > promptTokens-cacheReadTokens {
-		audioInputTokens = promptTokens - cacheReadTokens
+	if audioInputTokens > promptTokens-cacheReadTokens-cacheWriteTokens {
+		audioInputTokens = promptTokens - cacheReadTokens - cacheWriteTokens
+		if audioInputTokens < 0 {
+			audioInputTokens = 0
+		}
 	}
 	if audioOutputTokens < 0 {
 		audioOutputTokens = 0
@@ -566,25 +644,61 @@ func calcChatCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.TokenUsage, t
 		audioOutputTokens = completionTokens
 	}
 
-	cacheReadCost := entry.GetPriceInt(tierName, cluster_conf.PriceCacheReadInputTokenCostInt)
-	cacheWriteCost := entry.GetPriceInt(tierName, cluster_conf.PriceCacheCreationInputTokenCostInt)
-	audioInputCost := entry.GetPriceInt(tierName, cluster_conf.PriceInputCostPerAudioTokenInt)
-	audioOutputCost := entry.GetPriceInt(tierName, cluster_conf.PriceOutputCostPerAudioTokenInt)
+	cacheReadPrice := entry.GetPrice(tierName, cluster_conf.PriceCacheReadInputTokenCost)
+	cacheWritePrice := entry.GetPrice(tierName, cluster_conf.PriceCacheCreationInputTokenCost)
+	cacheWritePrice1h := entry.GetPrice(tierName, cluster_conf.PriceCacheCreationInputTokenCost1h)
+	audioInputPrice := entry.GetPrice(tierName, cluster_conf.PriceInputCostPerAudioToken)
+	audioOutputPrice := entry.GetPrice(tierName, cluster_conf.PriceOutputCostPerAudioToken)
+	imageInputPrice := entry.GetPrice(tierName, cluster_conf.PriceInputCostPerImageToken)
+
+	// Length-tier billing: pick input/output price by the total input token
+	// count (promptTokens, including cache read/write); exceeding a tier
+	// threshold bills the whole request at that tier. A tier side whose key
+	// is not configured (-1) keeps the base price on that side. With no tier
+	// key configured (ok=false) the base prices are used, exactly as before.
+	inputPrice := entry.GetPrice(tierName, cluster_conf.PriceInputCostPerToken)
+	outputPrice := entry.GetPrice(tierName, cluster_conf.PriceOutputCostPerToken)
+	if tierIn, tierOut, ok := entry.GetLengthTierPrice(tierName, promptTokens); ok {
+		if tierIn >= 0 {
+			inputPrice = tierIn
+		}
+		if tierOut >= 0 {
+			outputPrice = tierOut
+		}
+	}
 
 	// normal input/output start as the full totals
 	normalInput := promptTokens
 	normalOutput := completionTokens
 
-	// cache-aware billing: split cache read from prompt
-	if cacheReadCost > 0 || cacheWriteCost > 0 {
-		normalInput = promptTokens - cacheReadTokens
+	// cache-aware billing: split cache read/write from prompt.
+	// PromptTokens is the total input (for Anthropic it is normalized to
+	// input_tokens + cache read + cache write at parse time), so both cache
+	// parts must be removed to get the normal (fresh) input tokens.
+	if cacheReadPrice > 0 || cacheWritePrice > 0 {
+		normalInput = promptTokens - cacheReadTokens - cacheWriteTokens
 		if normalInput < 0 {
 			normalInput = 0
 		}
 	}
 
+	// image-aware billing: split image input from normal input
+	imageInputTokens := usage.ImageInputTokens
+	if imageInputPrice > 0 {
+		if imageInputTokens > normalInput {
+			imageInputTokens = normalInput
+		}
+		normalInput = normalInput - imageInputTokens
+		if normalInput < 0 {
+			normalInput = 0
+		}
+	} else {
+		// no image input price configured: bill image input as normal input
+		imageInputTokens = 0
+	}
+
 	// audio-aware billing: split audio input from normal input
-	if audioInputCost > 0 {
+	if audioInputPrice > 0 {
 		if audioInputTokens > normalInput {
 			audioInputTokens = normalInput
 		}
@@ -598,7 +712,7 @@ func calcChatCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.TokenUsage, t
 	}
 
 	// audio-aware billing: split audio output from completion
-	if audioOutputCost > 0 {
+	if audioOutputPrice > 0 {
 		if audioOutputTokens > completionTokens {
 			audioOutputTokens = completionTokens
 		}
@@ -611,18 +725,38 @@ func calcChatCost(entry *cluster_conf.ModelPrice, usage *bfe_basic.TokenUsage, t
 		audioOutputTokens = 0
 	}
 
-	var cost int64
-	if cacheReadCost > 0 || cacheWriteCost > 0 || audioInputCost > 0 || audioOutputCost > 0 {
-		cost = normalInput*inputCost +
-			cacheReadTokens*cacheReadCost +
-			cacheWriteTokens*cacheWriteCost +
-			audioInputTokens*audioInputCost +
-			normalOutput*outputCost +
-			audioOutputTokens*audioOutputCost
-	} else {
-		// fallback to legacy billing when no cache/audio price is configured
-		cost = promptTokens*inputCost + completionTokens*outputCost
+	// 1h-TTL cache write split: bill the 1h portion at its own price, the
+	// remainder at the 5m (base cache_creation) price. This runs after the
+	// normal-input split above so the full cache write amount is removed
+	// from the normal input exactly as before; the 1h portion is then moved
+	// from the 5m remainder to its own billing item.
+	cacheWriteTokens1h := usage.CacheWriteTokens1h
+	if cacheWriteTokens1h < 0 {
+		cacheWriteTokens1h = 0
 	}
+	if cacheWritePrice1h > 0 {
+		if cacheWriteTokens1h > cacheWriteTokens {
+			cacheWriteTokens1h = cacheWriteTokens
+		}
+		cacheWriteTokens -= cacheWriteTokens1h
+	} else {
+		// no 1h price configured: bill all cache writes at the base price
+		cacheWriteTokens1h = 0
+	}
+
+	// Each billing item is converted to a fixed-point integer separately and
+	// the integers are summed, so floating point only participates in single
+	// multiplications well below 2^53. Items with an unconfigured price (0)
+	// contribute nothing, which preserves the legacy fallback semantics of
+	// billing unconfigured sub-token usage at the normal input/output price.
+	cost := quota.CalcCostUnits(normalInput, inputPrice)
+	cost += quota.CalcCostUnits(cacheReadTokens, cacheReadPrice)
+	cost += quota.CalcCostUnits(cacheWriteTokens, cacheWritePrice)
+	cost += quota.CalcCostUnits(cacheWriteTokens1h, cacheWritePrice1h)
+	cost += quota.CalcCostUnits(audioInputTokens, audioInputPrice)
+	cost += quota.CalcCostUnits(imageInputTokens, imageInputPrice)
+	cost += quota.CalcCostUnits(normalOutput, outputPrice)
+	cost += quota.CalcCostUnits(audioOutputTokens, audioOutputPrice)
 
 	return cost
 }

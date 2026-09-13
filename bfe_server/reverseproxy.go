@@ -48,9 +48,9 @@ import (
 	"github.com/bfenetworks/bfe/bfe_fcgi"
 	"github.com/bfenetworks/bfe/bfe_http"
 	"github.com/bfenetworks/bfe/bfe_http2"
+	modelprotocol "github.com/bfenetworks/bfe/bfe_model_protocol"
 	"github.com/bfenetworks/bfe/bfe_module"
 	"github.com/bfenetworks/bfe/bfe_modules/mod_ai_rate_limit"
-	"github.com/bfenetworks/bfe/bfe_modules/mod_ai_token_auth"
 	"github.com/bfenetworks/bfe/bfe_modules/mod_body_process"
 	"github.com/bfenetworks/bfe/bfe_route"
 	"github.com/bfenetworks/bfe/bfe_route/bfe_cluster"
@@ -901,6 +901,14 @@ func (p *ReverseProxy) ServeHTTP(rw bfe_http.ResponseWriter, basicReq *bfe_basic
 	}
 
 response_got:
+	// Invariant guard: for any response about to be sent, HttpResponse must
+	// be attached. Internal response construction paths (e.g. an early
+	// version of CreateSpecifiedContentResp) once omitted the assignment,
+	// causing a nil pointer panic in HandleReadResponse/HandleRequestFinish
+	// callbacks (bfenetworks/bfe#1359).
+	if res != nil && basicReq.HttpResponse == nil {
+		basicReq.HttpResponse = res
+	}
 	if res != nil && res.IsSse {
 		if !basicReq.IsSse {
 			timeoutReadClient = -1
@@ -1309,7 +1317,7 @@ func (p *ReverseProxy) ServeHTTPForAI(rw bfe_http.ResponseWriter, basicReq *bfe_
 			// last attempt
 			break
 		}
-		if !shouldTriggerFallback(res, invokeErr) {
+		if !shouldTriggerFallback(res, invokeErr, aiMeta.AuthStyle) {
 			break
 		}
 
@@ -1356,6 +1364,11 @@ func (p *ReverseProxy) ServeHTTPForAI(rw bfe_http.ResponseWriter, basicReq *bfe_
 	}
 
 response_got:
+	// Invariant guard: for any response about to be sent, HttpResponse must
+	// be attached. See the identical guard in ServeHTTP.
+	if res != nil && basicReq.HttpResponse == nil {
+		basicReq.HttpResponse = res
+	}
 	if res != nil && res.IsSse {
 		timeoutReadClient = -1
 		p.setTimeout(bfe_basic.StageReadReqBody, basicReq.Connection, req, timeoutReadClient)
@@ -1501,6 +1514,10 @@ func (p *ReverseProxy) doSingleAIForward(srv *BfeServer, cluster *bfe_cluster.Bf
 		aiMeta.AuthStyle = bfe_basic.DetectAuthStyle(basicReq)
 	}
 
+	// Protocol selection is per-request: pick the adapter matching the
+	// request auth style (unknown styles fall back to the openai adapter).
+	adapter := modelprotocol.Get(aiMeta.AuthStyle)
+
 	// Reject if the cluster provider does not support the request protocol.
 	if cluster.AIConf != nil && !clusterSupportsAuthStyle(cluster.AIConf.ModelProtocols, aiMeta.AuthStyle) {
 		err := bfe_basic.NewAiError(
@@ -1569,14 +1586,17 @@ func (p *ReverseProxy) doSingleAIForward(srv *BfeServer, cluster *bfe_cluster.Bf
 		}
 		aiMeta.AppendClusterKeyName(cluster.Name, selectedKey.Name)
 		if selectedKey.Key != "" {
-			mod_ai_token_auth.SetApiKey(outreq, selectedKey.Key, aiMeta.AuthStyle)
+			if err := adapter.InjectAuth(outreq, selectedKey.Key); err != nil {
+				log.Logger.Warn("doSingleAIForward: inject auth failed: %v", err)
+			}
 		}
 	}
 
-	// Inject anthropic-version for Anthropic style requests if not present.
-	if aiMeta.AuthStyle == bfe_basic.AuthStyleAnthropic {
-		if outreq.Header.Get("anthropic-version") == "" {
-			outreq.Header.Set("anthropic-version", "2023-06-01")
+	// Inject protocol-specific supplementary headers (e.g. anthropic-version
+	// for Anthropic style requests) if not already present on the request.
+	for k, v := range adapter.ExtraHeaders() {
+		if outreq.Header.Get(k) == "" {
+			outreq.Header.Set(k, v)
 		}
 	}
 
@@ -1758,11 +1778,21 @@ var aiFallbackStatusCodes = map[int]struct{}{
 	429: {},
 }
 
-func shouldTriggerFallback(res *bfe_http.Response, err error) bool {
+func shouldTriggerFallback(res *bfe_http.Response, err error, authStyle string) bool {
 	if err != nil {
 		return true
 	}
 	code := getResponseStatus(res)
+
+	// Protocol-specific error normalization seam: pick the normalizer of
+	// the adapter identified for this request (unknown styles fall back to
+	// the openai adapter). Phase 1: every adapter returns the default
+	// normalizer, which always returns nil, so the legacy status-code
+	// whitelist below keeps deciding, unchanged.
+	if perr := modelprotocol.Get(authStyle).ErrorNormalizer().Normalize(code, nil, nil); perr != nil {
+		return perr.IsUpstream && (perr.SwapKey || perr.Retryable)
+	}
+
 	if code >= 500 {
 		return true
 	}
@@ -2150,13 +2180,5 @@ func chooseAIKeyWithAffinity(
 // request protocol/auth style. An empty modelProtocols defaults to OpenAI
 // only for backward compatibility.
 func clusterSupportsAuthStyle(modelProtocols []string, authStyle string) bool {
-	if len(modelProtocols) == 0 {
-		return authStyle == bfe_basic.AuthStyleOpenAI
-	}
-	for _, mp := range modelProtocols {
-		if mp == authStyle {
-			return true
-		}
-	}
-	return false
+	return modelprotocol.Supports(modelProtocols, authStyle)
 }

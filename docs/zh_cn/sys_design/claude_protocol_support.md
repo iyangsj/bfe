@@ -131,6 +131,11 @@ type AiBasicInfo struct {
     ClusterKeyNames []ClusterKeyName
 
     allowEstimateToken bool
+    // 请求完成状态（issue #1352，详见 rmb_quota.md 6.4）：
+    // responseCompleted 表示上游响应正常完成；finalUsageSeen 表示已解析到最终 usage
+    // （Anthropic message_start 的初始 usage 不算）
+    responseCompleted bool
+    finalUsageSeen    bool
 }
 ```
 
@@ -161,6 +166,8 @@ type AIConf struct {
 ---
 
 ## 5. 模块职责
+
+> **实现收敛说明（2026-09）**：本节描述的识别、认证头注入、usage 字段链的实现已收敛到协议适配层 `bfe/bfe_model_protocol/`（见 `sys_design/model_protocol_adapter.md`）：识别规则在 `detect.go`，认证头/版本头在 openai/anthropic 适配器的 `InjectAuth`/`ExtraHeaders`，usage 字段链在适配器的 `ExtractUsageFields`。本文档描述的业务语义与行为不变，`bfe_basic.GetApiKey`/`DetectAuthStyle`、`mod_ai_token_auth.SetApiKey`/`UpdateCtxByUsage`、`SSEEvent/RawEvent.GetQuotaUsage` 均保留原签名委托适配层。
 
 ### 5.1 `bfe_server/http_conn.go`
 
@@ -206,15 +213,17 @@ func DetectAuthStyle(req *Request) string {
 
 - `SetApiKey(req, apiKey, authStyle)` 按协议注入对应认证头；
 - `UpdateCtxByUsage()` 在 OpenAI 字段后增加 Claude fallback：
-  - `usage.input_tokens` → `PromptTokens`；
+  - `usage.input_tokens` → `PromptTokens`（**注意**：Anthropic 的 `input_tokens` 仅含 cache miss 的 fresh token，不含 cache 读写；解析时归一化为总输入 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`，与 OpenAI `prompt_tokens` 语义一致）；
   - `usage.output_tokens` → `CompletionTokens`；
   - `usage.cache_read_input_tokens` → `CacheReadTokens`；
   - `usage.cache_creation_input_tokens` → `CacheWriteTokens`；
-  - `UsedQuota` 由 `input + output` 推导。
+  - `UsedQuota` 由归一化后的 `input + output` 推导。
+  - 2026-09-04 起（issue #1352）：流式 `message_start` 的初始 usage 位于 `message.usage.*`，解析时增加该路径回退；`message_start` 的初始 usage（`output_tokens = 0`）不得当作最终 usage，最终 usage 以 `message_delta` 为准。
 
 ### 5.5 `mod_body_process`
 
 - `SSEEvent.GetQuotaUsage()` 与 `RawEvent.GetQuotaUsage()` 同样支持 Claude usage 字段 fallback；
+- 2026-09-04 起（issue #1352）：`QuotaUsage` 携带 `IsFinalUsage` / `IsTermination` 标志，`QuotaUsageProcessor.Process` 据此在 `AiBasicInfo` 上置位 `finalUsageSeen` / `responseCompleted`，并把 `message_delta` 的最终 usage 与 `message_start` 的输入 token 合并落账（详见 `rmb_quota.md` 7.4）；
 - 继续负责流式场景的 `TTFT` / `TPOT` 计算。
 
 ### 5.6 `mod_access_pb3`
@@ -310,6 +319,7 @@ BFE 会根据每个请求的 `AuthStyle` 自动选择认证头注入方式，不
 | `mod_ai_token_auth.UpdateCtxByUsage` | OpenAI usage JSON；Claude usage JSON；混合字段时的优先级 |
 | `mod_body_process.SSEEvent.GetQuotaUsage` | Claude 流式 usage 字段解析 |
 | `mod_body_process.RawEvent.GetQuotaUsage` | Claude 非流式 usage 字段解析 |
+| `bfe_model_protocol`（适配器，收敛后） | `openai/anthropic` 适配器的 `InjectAuth`/`ExtraHeaders`/`ExtractUsageFields`；`detect.go` 识别规则；registry 回落与 `ValidateProtocols` |
 | `bfe_server`（协议匹配） | Anthropic 风格请求命中 `model_protocols=["openai"]` 的集群返回 400；OpenAI 风格请求命中 `model_protocols=["anthropic"]` 的集群返回 400 |
 | `mod_access_pb3` | `ai_protocol` 字段被正确填充为 `openai` 或 `anthropic` |
 
@@ -347,7 +357,8 @@ BFE 会根据每个请求的 `AuthStyle` 自动选择认证头注入方式，不
 - `bfe/docs/zh_cn/modifications/2026-08-20-claude-protocol-support/design-changes.md`
 - `bfe/docs/zh_cn/sys_design/ai_access_log_fields.md`
 - `bfe/docs/zh_cn/sys_design/multi_api_key.md`
+- `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
 - `bfe/docs/zh_cn/sys_design/provider_model_prefix_routing.md`
 - `bfe/docs/zh_cn/sys_design/rmb_quota.md`
-- `bfe-access-pb/RELEASE_NOTES_v0.3.4.md`
+- `bfe-access-pb/CHANGELOG.md`
 - `bfe-access-pb/docs/protobuf.md`

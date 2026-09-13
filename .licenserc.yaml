@@ -27,6 +27,7 @@ header:
     - '**/testdata/*'
     - '**/test_data/**'
     - '**/*/testdata/*/**'
+    - '**/testdata_*/**'
     - 'LICENSE'
     - 'NOTICE'
     - 'VERSION'

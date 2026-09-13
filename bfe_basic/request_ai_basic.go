@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/bfenetworks/bfe/bfe_http"
+	"github.com/bfenetworks/bfe/bfe_model_protocol"
 )
 
 const (
@@ -45,25 +46,30 @@ const (
 	ModeOcr                = "ocr"
 	ModeSearch             = "search"
 	ModeRealtime           = "realtime"
+	ModeResponses          = "responses"
 )
 
 // AI protocol/auth styles.
 const (
 	AuthStyleOpenAI    = "openai"
 	AuthStyleAnthropic = "anthropic"
+	AuthStyleGemini    = "gemini"
 	AuthStyleUnknown   = "unknown"
 )
 
 type TokenUsage struct {
-	PromptTokens      int64 // number of tokens in the prompt (includes cache_read_tokens, audio_input_tokens)
-	CompletionTokens  int64 // number of tokens in the completion (includes audio_output_tokens)
-	CacheReadTokens   int64 // usage.cache_read_tokens, already included in PromptTokens
-	CacheWriteTokens  int64 // usage.cache_write_tokens, independent add-on item
-	AudioInputTokens  int64 // usage.audio_input_tokens, already included in PromptTokens
-	AudioOutputTokens int64 // usage.audio_output_tokens, already included in CompletionTokens
-	ImageCount        int64 // number of generated images for image generation models
-	UsedQuota         int64 // used quota for this request (unit=total_token)
-	UsedCost          int64 // used RMB cost for this request, 1 unit = 1e-8 yuan (unit=RMB)
+	PromptTokens       int64 // number of tokens in the prompt (includes cache_read_tokens, audio_input_tokens, image_input_tokens)
+	CompletionTokens   int64 // number of tokens in the completion (includes audio_output_tokens)
+	CacheReadTokens    int64 // usage.cache_read_tokens, already included in PromptTokens
+	CacheWriteTokens   int64 // usage.cache_write_tokens, already included in PromptTokens (normalized for Anthropic)
+	CacheWriteTokens1h int64 // 1h-TTL cache write tokens (usage.cache_creation.ephemeral_1h_input_tokens), already included in CacheWriteTokens
+	AudioInputTokens   int64 // usage.audio_input_tokens, already included in PromptTokens
+	AudioOutputTokens  int64 // usage.audio_output_tokens, already included in CompletionTokens
+	ImageInputTokens   int64 // usage.image_input_tokens / input_token_details.image_tokens, already included in PromptTokens
+	VideoCount         int64 // number of generated videos for video generation models
+	ImageCount         int64 // number of generated images for image generation models
+	UsedQuota          int64 // used quota for this request (unit=total_token)
+	UsedCost           int64 // used RMB cost for this request, 1 unit = 1e-8 yuan (unit=RMB)
 }
 
 type TokenTimeInfo struct {
@@ -103,6 +109,16 @@ type AiBasicInfo struct {
 	ClusterKeyNames []ClusterKeyName // tried (cluster, key) pairs during request processing
 
 	allowEstimateToken bool
+
+	// responseCompleted marks whether the upstream response finished
+	// normally: the termination event was seen for streaming responses
+	// (e.g. Anthropic message_stop, OpenAI [DONE]) or the full body was
+	// read for non-streaming responses.
+	responseCompleted bool
+	// finalUsageSeen marks whether the final usage was parsed from the
+	// response. An initial usage such as Anthropic message_start
+	// (output_tokens = 0) does not count.
+	finalUsageSeen bool
 }
 
 // ClusterKeyName represents a tried cluster and API-Key pair during request processing
@@ -123,28 +139,32 @@ func (aiinfo *AiBasicInfo) IsAllowEstimateToken() bool {
 	return aiinfo.allowEstimateToken
 }
 
+func (aiinfo *AiBasicInfo) MarkResponseCompleted() {
+	aiinfo.responseCompleted = true
+}
+
+func (aiinfo *AiBasicInfo) IsResponseCompleted() bool {
+	return aiinfo.responseCompleted
+}
+
+func (aiinfo *AiBasicInfo) MarkFinalUsageSeen() {
+	aiinfo.finalUsageSeen = true
+}
+
+func (aiinfo *AiBasicInfo) IsFinalUsageSeen() bool {
+	return aiinfo.finalUsageSeen
+}
+
 func GetApiKey(req *Request) string {
-	// 1. prefer Authorization: Bearer <key> for OpenAI style
-	authHeader := req.HttpRequest.Header.Get("Authorization")
-	if authHeader != "" {
-		// remove "Bearer " prefix if exists
-		authHeader = strings.TrimPrefix(authHeader, "Bearer ")
-		authHeader = strings.TrimPrefix(authHeader, "sk-")
+	protocol, key := bfe_model_protocol.DetectProtocolAndKey(req.HttpRequest)
+	// preserve the legacy side effect: AuthStyle is set only when a
+	// credential header was found (Authorization preferred over x-api-key)
+	if protocol != "" {
 		if ai := req.GetAiBasicInfo(); ai != nil {
-			ai.AuthStyle = AuthStyleOpenAI
+			ai.AuthStyle = protocol
 		}
-		return authHeader
 	}
-
-	// 2. fallback to x-api-key for Anthropic style
-	if xApiKey := req.HttpRequest.Header.Get("x-api-key"); xApiKey != "" {
-		if ai := req.GetAiBasicInfo(); ai != nil {
-			ai.AuthStyle = AuthStyleAnthropic
-		}
-		return xApiKey
-	}
-
-	return ""
+	return key
 }
 
 // DetectAuthStyle infers the AI protocol/auth style from request characteristics.
@@ -154,18 +174,7 @@ func DetectAuthStyle(req *Request) string {
 		return AuthStyleUnknown
 	}
 
-	path := req.HttpRequest.URL.Path
-	if strings.HasPrefix(path, "/v1/messages") {
-		return AuthStyleAnthropic
-	}
-
-	// x-api-key without Authorization indicates Anthropic style
-	if req.HttpRequest.Header.Get("x-api-key") != "" &&
-		req.HttpRequest.Header.Get("Authorization") == "" {
-		return AuthStyleAnthropic
-	}
-
-	return AuthStyleOpenAI
+	return bfe_model_protocol.DetectProtocol(req.HttpRequest)
 }
 
 // DetectModeFromPath infers the AI request mode from the request path.
@@ -188,6 +197,10 @@ func DetectModeFromPath(path string) string {
 		return ModeAudioTranscription
 	case strings.HasPrefix(path, "/v1/rerank"):
 		return ModeRerank
+	case strings.HasPrefix(path, "/v1/video/generations"):
+		return ModeVideoGeneration
+	case strings.HasPrefix(path, "/v1/responses"):
+		return ModeResponses
 	default:
 		return ModeChat
 	}

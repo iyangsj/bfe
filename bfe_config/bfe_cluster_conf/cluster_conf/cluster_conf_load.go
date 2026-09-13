@@ -17,12 +17,11 @@
 package cluster_conf
 
 import (
-	"bytes"
 	"crypto/x509"
 	"encoding/pem"
-	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -167,81 +166,25 @@ type PriceTier struct {
 	TimeRanges []TimeRange // hit any range means the request belongs to this tier
 }
 
-// PriceMap is a map of price keys to their numeric values.
-// It marshals to JSON using decimal notation instead of scientific notation.
+// PriceMap is a map of price keys to their numeric values (yuan per unit).
+// Prices may use more than 8 decimal places and are serialized with the
+// default JSON encoder, which may emit scientific notation (e.g. 1.5e-6).
 type PriceMap map[string]float64
 
-// MarshalJSON serializes PriceMap using decimal notation for all values.
-func (p PriceMap) MarshalJSON() ([]byte, error) {
-	if p == nil {
-		return []byte("null"), nil
-	}
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	first := true
-	for k, v := range p {
-		if !first {
-			buf.WriteByte(',')
-		}
-		first = false
-		keyBytes, err := stdjson.Marshal(k)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(keyBytes)
-		buf.WriteByte(':')
-		buf.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
-	}
-	buf.WriteByte('}')
-	return buf.Bytes(), nil
-}
-
 // TierPriceMap is a map of tier names to PriceMap values.
-// It marshals to JSON using decimal notation instead of scientific notation.
 type TierPriceMap map[string]map[string]float64
 
-// MarshalJSON serializes TierPriceMap using decimal notation for all nested values.
-func (t TierPriceMap) MarshalJSON() ([]byte, error) {
-	if t == nil {
-		return []byte("null"), nil
-	}
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	first := true
-	for tier, prices := range t {
-		if !first {
-			buf.WriteByte(',')
-		}
-		first = false
-		tierBytes, err := stdjson.Marshal(tier)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(tierBytes)
-		buf.WriteByte(':')
-		if prices == nil {
-			buf.WriteString("null")
-			continue
-		}
-		innerFirst := true
-		buf.WriteByte('{')
-		for k, v := range prices {
-			if !innerFirst {
-				buf.WriteByte(',')
-			}
-			innerFirst = false
-			keyBytes, err := stdjson.Marshal(k)
-			if err != nil {
-				return nil, err
-			}
-			buf.Write(keyBytes)
-			buf.WriteByte(':')
-			buf.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
-		}
-		buf.WriteByte('}')
-	}
-	buf.WriteByte('}')
-	return buf.Bytes(), nil
+// lengthTier is a parsed length-tier price entry. The side prices are
+// parsed from default Prices at load time; -1 marks a side whose key is
+// not configured for this tier, so the caller keeps the base price on that
+// side. The keys are kept for tier-priority lookup (TierPrices[tier] wins
+// over default Prices, same as GetPrice).
+type lengthTier struct {
+	threshold   int64   // 200000 / 256000 / 272000 / 512000
+	inputKey    string  // e.g. input_cost_per_token_above_272k_tokens
+	outputKey   string  // e.g. output_cost_per_token_above_272k_tokens
+	inputPrice  float64 // -1 when the tier input key is not configured
+	outputPrice float64 // -1 when the tier output key is not configured
 }
 
 // ModelPrice represents a single model pricing entry in AIConf.ModelTable
@@ -253,13 +196,13 @@ type ModelPrice struct {
 	Capabilities        []string
 	SupportedParameters []string
 	Limits              map[string]interface{}
-	Prices              PriceMap     // default prices
+	Prices              PriceMap     // default prices (yuan per unit, float64)
 	TierPrices          TierPriceMap // tier name -> price table
 	Metadata            map[string]interface{}
 
-	// pricesInt and tierPricesInt are built at config load time.
-	pricesInt     map[string]int64
-	tierPricesInt map[string]map[string]int64
+	// lengthTiers is parsed at config load time (ModelTableCheck) from the
+	// hard-coded length-tier keys above, ordered by ascending threshold.
+	lengthTiers []lengthTier
 }
 
 // ModelTable represents the cost/pricing table for a cluster
@@ -299,33 +242,41 @@ type AIConf struct {
 }
 
 const (
-	PriceInputCostPerToken           = "input_cost_per_token"
-	PriceOutputCostPerToken          = "output_cost_per_token"
-	PriceCacheReadInputTokenCost     = "cache_read_input_token_cost"
-	PriceCacheCreationInputTokenCost = "cache_creation_input_token_cost"
-	PriceInputCostPerAudioToken      = "input_cost_per_audio_token"
-	PriceOutputCostPerAudioToken     = "output_cost_per_audio_token"
-	PriceOutputCostPerImage          = "output_cost_per_image"
+	PriceInputCostPerToken             = "input_cost_per_token"
+	PriceOutputCostPerToken            = "output_cost_per_token"
+	PriceCacheReadInputTokenCost       = "cache_read_input_token_cost"
+	PriceCacheCreationInputTokenCost   = "cache_creation_input_token_cost"
+	PriceInputCostPerAudioToken        = "input_cost_per_audio_token"
+	PriceOutputCostPerAudioToken       = "output_cost_per_audio_token"
+	PriceOutputCostPerImage            = "output_cost_per_image"
+	PriceInputCostPerImageToken        = "input_cost_per_image_token"
+	PriceOutputCostPerVideo            = "output_cost_per_video"
+	PriceCacheCreationInputTokenCost1h = "cache_creation_input_token_cost_1h"
 
-	PriceInputCostPerTokenInt           = "input_cost_per_token_int"
-	PriceOutputCostPerTokenInt          = "output_cost_per_token_int"
-	PriceCacheReadInputTokenCostInt     = "cache_read_input_token_cost_int"
-	PriceCacheCreationInputTokenCostInt = "cache_creation_input_token_cost_int"
-	PriceInputCostPerAudioTokenInt      = "input_cost_per_audio_token_int"
-	PriceOutputCostPerAudioTokenInt     = "output_cost_per_audio_token_int"
-	PriceOutputCostPerImageInt          = "output_cost_per_image_int"
+	// Length-tier price keys (hard-coded tiers, tokens). When the total input
+	// token count exceeds a tier threshold, the whole request is billed at
+	// that tier's input/output price.
+	PriceInputCostPerTokenAbove200kTokens  = "input_cost_per_token_above_200k_tokens"
+	PriceOutputCostPerTokenAbove200kTokens = "output_cost_per_token_above_200k_tokens"
+	PriceInputCostPerTokenAbove256kTokens  = "input_cost_per_token_above_256k_tokens"
+	PriceOutputCostPerTokenAbove256kTokens = "output_cost_per_token_above_256k_tokens"
+	PriceInputCostPerTokenAbove272kTokens  = "input_cost_per_token_above_272k_tokens"
+	PriceOutputCostPerTokenAbove272kTokens = "output_cost_per_token_above_272k_tokens"
+	PriceInputCostPerTokenAbove512kTokens  = "input_cost_per_token_above_512k_tokens"
+	PriceOutputCostPerTokenAbove512kTokens = "output_cost_per_token_above_512k_tokens"
 )
 
-// priceKeyToIntKey maps the public price keys (used in config files) to the
-// internal fixed-point integer keys used at runtime.
-var priceKeyToIntKey = map[string]string{
-	PriceInputCostPerToken:           PriceInputCostPerTokenInt,
-	PriceOutputCostPerToken:          PriceOutputCostPerTokenInt,
-	PriceCacheReadInputTokenCost:     PriceCacheReadInputTokenCostInt,
-	PriceCacheCreationInputTokenCost: PriceCacheCreationInputTokenCostInt,
-	PriceInputCostPerAudioToken:      PriceInputCostPerAudioTokenInt,
-	PriceOutputCostPerAudioToken:     PriceOutputCostPerAudioTokenInt,
-	PriceOutputCostPerImage:          PriceOutputCostPerImageInt,
+// lengthTierKeys lists the hard-coded length-tier price keys in ascending
+// threshold order. The threshold is N*1000 tokens for the "Nk" suffix.
+var lengthTierKeys = []struct {
+	threshold int64
+	inputKey  string
+	outputKey string
+}{
+	{200 * 1000, PriceInputCostPerTokenAbove200kTokens, PriceOutputCostPerTokenAbove200kTokens},
+	{256 * 1000, PriceInputCostPerTokenAbove256kTokens, PriceOutputCostPerTokenAbove256kTokens},
+	{272 * 1000, PriceInputCostPerTokenAbove272kTokens, PriceOutputCostPerTokenAbove272kTokens},
+	{512 * 1000, PriceInputCostPerTokenAbove512kTokens, PriceOutputCostPerTokenAbove512kTokens},
 }
 
 func (conf *BackendHTTPS) GetProtocol() string {
@@ -397,14 +348,132 @@ type HashConf struct {
 	SessionSticky *bool
 }
 
+// Default values for EPP related conf (see GslbBasicConf).
+const (
+	DefaultEPPCheckInterval           = "2s"
+	DefaultEPPFailThreshold           = 3
+	DefaultEPPCooldown                = "45s"
+	DefaultEPPSuccessThreshold        = 2
+	DefaultEPPConnectTimeout          = "500ms"
+	DefaultEPPCallTimeout             = "3s"
+	DefaultEPPBreakerWindowSize       = 100
+	DefaultEPPBreakerMinVolume        = 20
+	DefaultEPPBreakerErrorRatePercent = 50
+	DefaultEPPBreakerOpenTimeout      = "30s"
+)
+
+// Parsed forms of default EPP conf values.
+func DefaultEPPCheckIntervalValue() time.Duration {
+	d, _ := time.ParseDuration(DefaultEPPCheckInterval)
+	return d
+}
+
+func DefaultEPPCooldownValue() time.Duration {
+	d, _ := time.ParseDuration(DefaultEPPCooldown)
+	return d
+}
+
+func DefaultEPPConnectTimeoutValue() time.Duration {
+	d, _ := time.ParseDuration(DefaultEPPConnectTimeout)
+	return d
+}
+
+func DefaultEPPCallTimeoutValue() time.Duration {
+	d, _ := time.ParseDuration(DefaultEPPCallTimeout)
+	return d
+}
+
+func DefaultEPPBreakerOpenTimeoutValue() time.Duration {
+	d, _ := time.ParseDuration(DefaultEPPBreakerOpenTimeout)
+	return d
+}
+
+// EPPCheckConf is health check and failover hysteresis conf for EPP,
+// only effective when BalanceMode is EPP.
+type EPPCheckConf struct {
+	Disabled bool // disable background health check (not recommended in production)
+
+	CheckInterval    *string // duration string, health check probe interval
+	FailThreshold    *int    // consecutive probe fails of active addr before failover
+	Cooldown         *string // duration string, no failback to a failed addr within cooldown
+	SuccessThreshold *int    // consecutive probe successes before failback to higher priority addr
+}
+
+// CheckIntervalDuration returns probe interval, default if unset or unparsable.
+func (c *EPPCheckConf) CheckIntervalDuration() time.Duration {
+	return parseEPPDuration(c.CheckInterval, DefaultEPPCheckInterval)
+}
+
+// CooldownDuration returns failover cooldown, default if unset or unparsable.
+func (c *EPPCheckConf) CooldownDuration() time.Duration {
+	return parseEPPDuration(c.Cooldown, DefaultEPPCooldown)
+}
+
+// EPPTimeoutConf is timeout conf for EPP calls, only effective when BalanceMode is EPP.
+type EPPTimeoutConf struct {
+	Connect *string // duration string, timeout for establishing gRPC connection/stream
+	Call    *string // duration string, timeout for first message (RequestHeaders Send+Recv)
+}
+
+// ConnectDuration returns connect timeout, default if unset or unparsable.
+func (c *EPPTimeoutConf) ConnectDuration() time.Duration {
+	return parseEPPDuration(c.Connect, DefaultEPPConnectTimeout)
+}
+
+// CallDuration returns first-message call timeout, default if unset or unparsable.
+func (c *EPPTimeoutConf) CallDuration() time.Duration {
+	return parseEPPDuration(c.Call, DefaultEPPCallTimeout)
+}
+
+// EPPTLSConf is transport security conf for EPP connections,
+// only effective when BalanceMode is EPP.
+type EPPTLSConf struct {
+	Insecure bool   // true = skip certificate verification (testing only)
+	CAFile   string // CA certificate file for verifying EPP server, required if Insecure is false
+}
+
+// EPPBreakerConf is circuit breaker conf of the EPP path, only effective
+// when BalanceMode is EPP. Breaker stops going to EPP entirely (falling back
+// to local balance) when the error rate of recent calls is too high,
+// complementing address-level failover.
+type EPPBreakerConf struct {
+	Disabled bool // true = disable circuit breaker
+
+	WindowSize       *int    // sliding window size (recent call results), default 100
+	MinVolume        *int    // min calls in window before evaluating, default 20
+	ErrorRatePercent *int    // error rate threshold (percent), default 50
+	OpenTimeout      *string // duration string, OPEN duration before HALF-OPEN probing, default "30s"
+}
+
+// OpenTimeoutDuration returns open timeout, default if unset or unparsable.
+func (c *EPPBreakerConf) OpenTimeoutDuration() time.Duration {
+	return parseEPPDuration(c.OpenTimeout, DefaultEPPBreakerOpenTimeout)
+}
+
+func parseEPPDuration(v *string, def string) time.Duration {
+	s := def
+	if v != nil && *v != "" {
+		s = *v
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		d, _ = time.ParseDuration(def)
+	}
+	return d
+}
+
 // GslbBasicConf is basic conf for Gslb
 type GslbBasicConf struct {
 	CrossRetry *int // retry cross sub clusters
 	RetryMax   *int // inner cluster retry
 	HashConf   *HashConf
 
-	BalanceMode *string   // balanceMode, default WRR
-	EPPAddr     *[]string // EPP address
+	BalanceMode *string         // balanceMode, default WRR
+	EPPAddr     *[]string       // EPP addresses, ordered primary/backup, effective when BalanceMode is EPP
+	EPPCheck    *EPPCheckConf   // EPP health check and failover hysteresis
+	EPPTimeout  *EPPTimeoutConf // EPP call timeouts
+	EPPTLS      *EPPTLSConf     // EPP transport security
+	EPPBreaker  *EPPBreakerConf // EPP circuit breaker
 }
 
 // ClusterBasicConf is basic conf for cluster.
@@ -760,8 +829,199 @@ func GslbBasicConfCheck(conf *GslbBasicConf) error {
 		if conf.EPPAddr == nil || len(*conf.EPPAddr) == 0 {
 			return errors.New("EPPAddr is nil or empty")
 		}
+		if err := checkEPPAddrs(*conf.EPPAddr); err != nil {
+			return err
+		}
+		if conf.EPPCheck == nil {
+			conf.EPPCheck = &EPPCheckConf{}
+		}
+		if conf.EPPTimeout == nil {
+			conf.EPPTimeout = &EPPTimeoutConf{}
+		}
+		if conf.EPPBreaker == nil {
+			conf.EPPBreaker = &EPPBreakerConf{}
+		}
+		if err := EPPCheckConfCheck(conf.EPPCheck); err != nil {
+			return err
+		}
+		if err := EPPTimeoutConfCheck(conf.EPPTimeout); err != nil {
+			return err
+		}
+		if err := EPPBreakerConfCheck(conf.EPPBreaker); err != nil {
+			return err
+		}
+		if err := EPPTLSConfCheck(conf.EPPTLS); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unsupported bal mode %s", *conf.BalanceMode)
+	}
+
+	return nil
+}
+
+// checkEPPAddrs validates EPP address list: each element must be host:port,
+// and duplicate addresses are rejected (primary/backup must be different instances).
+func checkEPPAddrs(addrs []string) error {
+	seen := make(map[string]bool)
+	for _, addr := range addrs {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || host == "" || port == "" {
+			return fmt.Errorf("EPPAddr element %q is not valid host:port", addr)
+		}
+		if seen[addr] {
+			return fmt.Errorf("EPPAddr element %q is duplicated", addr)
+		}
+		seen[addr] = true
+	}
+	return nil
+}
+
+// EPPCheckConfCheck checks EPPCheckConf, filling defaults for unset fields.
+func EPPCheckConfCheck(conf *EPPCheckConf) error {
+	if conf == nil {
+		return nil
+	}
+
+	if conf.CheckInterval == nil {
+		s := DefaultEPPCheckInterval
+		conf.CheckInterval = &s
+	}
+	if conf.FailThreshold == nil {
+		v := DefaultEPPFailThreshold
+		conf.FailThreshold = &v
+	}
+	if conf.Cooldown == nil {
+		s := DefaultEPPCooldown
+		conf.Cooldown = &s
+	}
+	if conf.SuccessThreshold == nil {
+		v := DefaultEPPSuccessThreshold
+		conf.SuccessThreshold = &v
+	}
+
+	if _, err := time.ParseDuration(*conf.CheckInterval); err != nil {
+		return fmt.Errorf("EPPCheck.CheckInterval %q is not valid duration: %v", *conf.CheckInterval, err)
+	}
+	if _, err := time.ParseDuration(*conf.Cooldown); err != nil {
+		return fmt.Errorf("EPPCheck.Cooldown %q is not valid duration: %v", *conf.Cooldown, err)
+	}
+	checkInterval, _ := time.ParseDuration(*conf.CheckInterval)
+	cooldown, _ := time.ParseDuration(*conf.Cooldown)
+	if checkInterval <= 0 {
+		return errors.New("EPPCheck.CheckInterval should be positive")
+	}
+	if *conf.FailThreshold < 1 {
+		return errors.New("EPPCheck.FailThreshold should be >= 1")
+	}
+	if cooldown <= 0 {
+		return errors.New("EPPCheck.Cooldown should be positive")
+	}
+	if *conf.SuccessThreshold < 1 {
+		return errors.New("EPPCheck.SuccessThreshold should be >= 1")
+	}
+
+	return nil
+}
+
+// EPPTimeoutConfCheck checks EPPTimeoutConf, filling defaults for unset fields.
+func EPPTimeoutConfCheck(conf *EPPTimeoutConf) error {
+	if conf == nil {
+		return nil
+	}
+
+	if conf.Connect == nil {
+		s := DefaultEPPConnectTimeout
+		conf.Connect = &s
+	}
+	if conf.Call == nil {
+		s := DefaultEPPCallTimeout
+		conf.Call = &s
+	}
+
+	if _, err := time.ParseDuration(*conf.Connect); err != nil {
+		return fmt.Errorf("EPPTimeout.Connect %q is not valid duration: %v", *conf.Connect, err)
+	}
+	if _, err := time.ParseDuration(*conf.Call); err != nil {
+		return fmt.Errorf("EPPTimeout.Call %q is not valid duration: %v", *conf.Call, err)
+	}
+	connect, _ := time.ParseDuration(*conf.Connect)
+	call, _ := time.ParseDuration(*conf.Call)
+	if connect <= 0 {
+		return errors.New("EPPTimeout.Connect should be positive")
+	}
+	if call <= 0 {
+		return errors.New("EPPTimeout.Call should be positive")
+	}
+
+	return nil
+}
+
+// EPPBreakerConfCheck checks EPPBreakerConf, filling defaults for unset fields.
+func EPPBreakerConfCheck(conf *EPPBreakerConf) error {
+	if conf == nil {
+		return nil
+	}
+
+	if conf.WindowSize == nil {
+		v := DefaultEPPBreakerWindowSize
+		conf.WindowSize = &v
+	}
+	if conf.MinVolume == nil {
+		v := DefaultEPPBreakerMinVolume
+		conf.MinVolume = &v
+	}
+	if conf.ErrorRatePercent == nil {
+		v := DefaultEPPBreakerErrorRatePercent
+		conf.ErrorRatePercent = &v
+	}
+	if conf.OpenTimeout == nil {
+		s := DefaultEPPBreakerOpenTimeout
+		conf.OpenTimeout = &s
+	}
+
+	if *conf.WindowSize < 1 {
+		return errors.New("EPPBreaker.WindowSize should be >= 1")
+	}
+	if *conf.MinVolume < 1 {
+		return errors.New("EPPBreaker.MinVolume should be >= 1")
+	}
+	if *conf.MinVolume > *conf.WindowSize {
+		return errors.New("EPPBreaker.MinVolume should not be bigger than WindowSize")
+	}
+	if *conf.ErrorRatePercent < 1 || *conf.ErrorRatePercent > 100 {
+		return errors.New("EPPBreaker.ErrorRatePercent should be in [1, 100]")
+	}
+	openTimeout, err := time.ParseDuration(*conf.OpenTimeout)
+	if err != nil {
+		return fmt.Errorf("EPPBreaker.OpenTimeout %q is not valid duration: %v", *conf.OpenTimeout, err)
+	}
+	if openTimeout <= 0 {
+		return errors.New("EPPBreaker.OpenTimeout should be positive")
+	}
+
+	return nil
+}
+
+// EPPTLSConfCheck checks EPPTLSConf.
+func EPPTLSConfCheck(conf *EPPTLSConf) error {
+	if conf == nil {
+		// Compat: existing deployments upgraded to this version do not configure
+		// EPPTLS at all. Rejecting them at load time would break rolling upgrades,
+		// so a nil EPPTLS keeps the legacy behavior (skip certificate verification)
+		// and only logs a warning to prompt migration. Certificate verification is
+		// enabled only when EPPTLS is explicitly configured.
+		log.Logger.Warn("EPPTLS not configured, EPP connections skip certificate verification (legacy behavior), please configure EPPTLS")
+		return nil
+	}
+
+	if !conf.Insecure && conf.CAFile == "" {
+		return errors.New("EPPTLS.CAFile is required when Insecure is false")
+	}
+	if !conf.Insecure {
+		if _, err := os.Stat(conf.CAFile); err != nil {
+			return fmt.Errorf("EPPTLS.CAFile %q is not readable: %v", conf.CAFile, err)
+		}
 	}
 
 	return nil
@@ -1085,37 +1345,56 @@ func ModelTableCheck(table *ModelTable) error {
 		audioInput := price.Prices[PriceInputCostPerAudioToken]
 		audioOutput := price.Prices[PriceOutputCostPerAudioToken]
 		outputCostPerImage := price.Prices[PriceOutputCostPerImage]
+		inputImageToken := price.Prices[PriceInputCostPerImageToken]
+		outputCostPerVideo := price.Prices[PriceOutputCostPerVideo]
+		cacheWrite1h := price.Prices[PriceCacheCreationInputTokenCost1h]
 		if input < 0 || output < 0 || cacheRead < 0 || cacheWrite < 0 ||
-			audioInput < 0 || audioOutput < 0 || outputCostPerImage < 0 {
+			audioInput < 0 || audioOutput < 0 || outputCostPerImage < 0 ||
+			inputImageToken < 0 || outputCostPerVideo < 0 || cacheWrite1h < 0 {
 			return fmt.Errorf("negative price for model %s", price.Model)
 		}
 
-		price.pricesInt = make(map[string]int64)
-		price.pricesInt[PriceInputCostPerTokenInt] = quota.RmbToFixedPoint(input)
-		price.pricesInt[PriceOutputCostPerTokenInt] = quota.RmbToFixedPoint(output)
-		price.pricesInt[PriceCacheReadInputTokenCostInt] = quota.RmbToFixedPoint(cacheRead)
-		price.pricesInt[PriceCacheCreationInputTokenCostInt] = quota.RmbToFixedPoint(cacheWrite)
-		price.pricesInt[PriceInputCostPerAudioTokenInt] = quota.RmbToFixedPoint(audioInput)
-		price.pricesInt[PriceOutputCostPerAudioTokenInt] = quota.RmbToFixedPoint(audioOutput)
-		price.pricesInt[PriceOutputCostPerImageInt] = quota.RmbToFixedPoint(outputCostPerImage)
+		// Parse the hard-coded length-tier keys into an ordered tier table.
+		// A side price of -1 marks a side whose key is not configured, so the
+		// caller falls back to the base price on that side.
+		price.lengthTiers = price.lengthTiers[:0]
+		for _, tk := range lengthTierKeys {
+			in, inOk := price.Prices[tk.inputKey]
+			if inOk && in < 0 {
+				return fmt.Errorf("negative price for model %s", price.Model)
+			}
+			out, outOk := price.Prices[tk.outputKey]
+			if outOk && out < 0 {
+				return fmt.Errorf("negative price for model %s", price.Model)
+			}
+			if !inOk && !outOk {
+				continue
+			}
+			tier := lengthTier{
+				threshold:   tk.threshold,
+				inputKey:    tk.inputKey,
+				outputKey:   tk.outputKey,
+				inputPrice:  -1,
+				outputPrice: -1,
+			}
+			if inOk {
+				tier.inputPrice = in
+			}
+			if outOk {
+				tier.outputPrice = out
+			}
+			price.lengthTiers = append(price.lengthTiers, tier)
+		}
 
-		price.tierPricesInt = make(map[string]map[string]int64)
 		for tierName, tierPriceMap := range price.TierPrices {
 			if tierName != "peak" {
 				return fmt.Errorf("unsupported tier name %s in TierPrices for model %s, only 'peak' is allowed", tierName, price.Model)
 			}
-			intMap := make(map[string]int64)
 			for key, val := range tierPriceMap {
 				if val < 0 {
 					return fmt.Errorf("negative tier price %s for model %s tier %s", key, price.Model, tierName)
 				}
-				intKey := key
-				if mapped, ok := priceKeyToIntKey[key]; ok {
-					intKey = mapped
-				}
-				intMap[intKey] = quota.RmbToFixedPoint(val)
 			}
-			price.tierPricesInt[tierName] = intMap
 		}
 
 		if table.priceIndex[price.Model] == nil {
@@ -1156,20 +1435,69 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 	return ""
 }
 
-// GetPriceInt returns the fixed-point price for the given tier and key.
+// GetPrice returns the float64 price (yuan per unit) for the given tier and key.
 // If tier is empty or the tier/key is not configured, it falls back to default Prices.
-func (p *ModelPrice) GetPriceInt(tier, key string) int64 {
-	if tier != "" && p.tierPricesInt != nil {
-		if tierMap, ok := p.tierPricesInt[tier]; ok {
+// Prices stay float64 until a billing item is converted via quota.CalcCostUnits
+// at request time, so prices with more than 8 decimal places keep their precision.
+func (p *ModelPrice) GetPrice(tier, key string) float64 {
+	v, _ := p.lookupPrice(tier, key)
+	return v
+}
+
+// lookupPrice returns the price for the given tier and key with tier priority:
+// TierPrices[tier][key] wins when configured, otherwise default Prices[key].
+// The second return value reports whether the key was configured at all.
+func (p *ModelPrice) lookupPrice(tier, key string) (float64, bool) {
+	if tier != "" && p.TierPrices != nil {
+		if tierMap, ok := p.TierPrices[tier]; ok {
 			if v, ok := tierMap[key]; ok {
-				return v
+				return v, true
 			}
 		}
 	}
-	if p.pricesInt != nil {
-		return p.pricesInt[key]
+	v, ok := p.Prices[key]
+	return v, ok
+}
+
+// GetLengthTierPrice returns the length-tier input/output unit prices
+// (yuan per token) selected by the total input token count (promptTokens,
+// including cache read/write). The selected tier is the highest tier whose
+// threshold promptTokens exceeds; the whole request is billed at that tier.
+// A side price of -1 means that side's key is not configured for the tier;
+// the caller keeps the base price on that side. ok is false when no tier key
+// is configured at all, or when promptTokens does not exceed any tier
+// threshold; the caller then bills at the base prices. Tier priority is the
+// same as GetPrice: keys in TierPrices[tierName] win over default Prices.
+func (p *ModelPrice) GetLengthTierPrice(tierName string, promptTokens int64) (input, output float64, ok bool) {
+	if len(p.lengthTiers) == 0 {
+		return 0, 0, false
 	}
-	return 0
+	idx := -1
+	for i := range p.lengthTiers {
+		if promptTokens > p.lengthTiers[i].threshold {
+			idx = i
+		} else {
+			break
+		}
+	}
+	if idx < 0 {
+		return 0, 0, false
+	}
+	tier := &p.lengthTiers[idx]
+	input, output = tier.inputPrice, tier.outputPrice
+	// tier priority, same as GetPrice: TierPrices[tierName] wins over the
+	// default Prices parsed at load time.
+	if tierName != "" && p.TierPrices != nil {
+		if tierMap, ok := p.TierPrices[tierName]; ok {
+			if v, ok := tierMap[tier.inputKey]; ok {
+				input = v
+			}
+			if v, ok := tierMap[tier.outputKey]; ok {
+				output = v
+			}
+		}
+	}
+	return input, output, true
 }
 
 // LookupModelPrice looks up a model price entry by model and mode.

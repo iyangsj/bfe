@@ -57,14 +57,30 @@ type MockBackend struct {
 	// request to determine the response status and body.
 	ResponseFunc func(r *http.Request, count int) (int, string)
 	// ResponseHeaders, if non-nil, is written to the response before the status code.
-	ResponseHeaders   map[string]string
-	hits              int
-	mu                sync.Mutex
-	models            []string
-	bodies            [][]byte
-	authHeaders       []string
-	xApiKeyHeaders    []string
-	anthropicVersions []string
+	ResponseHeaders map[string]string
+	// NoContentLength, if true, flushes the response headers before writing
+	// the body so the response uses chunked transfer encoding without a
+	// Content-Length header. The default (false) lets net/http infer a
+	// Content-Length for short bodies.
+	NoContentLength bool
+	// SSEEvents, if non-nil, switches the handler to server-sent event mode:
+	// each entry is written as one "data: <event>\n\n" frame followed by a
+	// flush. ResponseFunc/Response/Body are ignored in this mode.
+	SSEEvents []string
+	// SSEHold, if non-nil, blocks the handler after SSEEvents have been
+	// flushed and before SSETrailing is written. Closing it releases the stream.
+	SSEHold <-chan struct{}
+	// SSETrailing, if non-nil, is written (and flushed) after SSEHold is
+	// released, simulating backend data arriving after a client abort.
+	SSETrailing        []string
+	hits               int
+	mu                 sync.Mutex
+	models             []string
+	bodies             [][]byte
+	authHeaders        []string
+	xApiKeyHeaders     []string
+	xGoogApiKeyHeaders []string
+	anthropicVersions  []string
 }
 
 // NewMockBackend starts a local HTTP server that returns the given status code.
@@ -105,6 +121,7 @@ func NewMockBackend(clusterName string, response int, body string) *MockBackend 
 			b.bodies = append(b.bodies, append([]byte(nil), bodyBytes...))
 			b.authHeaders = append(b.authHeaders, r.Header.Get("Authorization"))
 			b.xApiKeyHeaders = append(b.xApiKeyHeaders, r.Header.Get("x-api-key"))
+			b.xGoogApiKeyHeaders = append(b.xGoogApiKeyHeaders, r.Header.Get("x-goog-api-key"))
 			b.anthropicVersions = append(b.anthropicVersions, r.Header.Get("anthropic-version"))
 			var reqBody map[string]interface{}
 			if err := json.Unmarshal(bodyBytes, &reqBody); err == nil {
@@ -125,10 +142,36 @@ func NewMockBackend(clusterName string, response int, body string) *MockBackend 
 		if b.ResponseFunc != nil {
 			status, body = b.ResponseFunc(r, count)
 		}
+
+		if b.SSEEvents != nil {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(status)
+			flusher, _ := w.(http.Flusher)
+			writeSSE := func(events []string) {
+				for _, event := range events {
+					fmt.Fprintf(w, "data: %s\n\n", event)
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+			}
+			writeSSE(b.SSEEvents)
+			if b.SSEHold != nil {
+				<-b.SSEHold
+			}
+			writeSSE(b.SSETrailing)
+			return
+		}
+
 		for k, v := range b.ResponseHeaders {
 			w.Header().Set(k, v)
 		}
 		w.WriteHeader(status)
+		if b.NoContentLength {
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
 		if body != "" {
 			w.Write([]byte(body))
 		}
@@ -173,6 +216,13 @@ func (b *MockBackend) XApiKeyHeaders() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]string(nil), b.xApiKeyHeaders...)
+}
+
+// XGoogApiKeyHeaders returns a deep copy of all observed x-goog-api-key headers.
+func (b *MockBackend) XGoogApiKeyHeaders() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.xGoogApiKeyHeaders...)
 }
 
 // AnthropicVersions returns a deep copy of all observed anthropic-version headers.

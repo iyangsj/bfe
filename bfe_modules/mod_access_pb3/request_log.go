@@ -76,6 +76,10 @@ func (m *ModuleAccessPb3) requestLogGen(req *bfe_basic.Request, res *bfe_http.Re
 	// AI info
 	reqAiInfoGen(requestLog, req, res)
 
+	// credential masking gate: the last line of defense before log output,
+	// ensure raw API Key never lands in any field (see bfenetworks/bfe#1357)
+	maskSensitiveCredentials(requestLog, req)
+
 	return bfeLog
 }
 
@@ -218,11 +222,8 @@ func reqReqHeaderInfoGen(reqLog *bfe_access_pb3.RequestLog, req *bfe_basic.Reque
 	}
 
 	// Authorization
-	values, found = req.HttpRequest.Header["Authorization"]
-	if found {
-		data := strings.Join(values, ",")
-		reqLog.Authorization = proto.String(data)
-	}
+	// The raw Authorization header (which carries the consumer API Key) must
+	// never be written to the access log (see bfenetworks/bfe#1357).
 
 	// User-Agent
 	values, found = req.HttpRequest.Header["User-Agent"]
@@ -425,6 +426,9 @@ func reqAiInfoGen(reqLog *bfe_access_pb3.RequestLog, req *bfe_basic.Request, res
 		if usage.CacheWriteTokens > 0 {
 			reqLog.AiCacheWriteTokens = proto.Int64(usage.CacheWriteTokens)
 		}
+		if usage.CacheWriteTokens1h > 0 {
+			reqLog.AiCacheWrite_1HTokens = proto.Int64(usage.CacheWriteTokens1h)
+		}
 		if usage.AudioInputTokens > 0 {
 			reqLog.AiAudioInputTokens = proto.Int64(usage.AudioInputTokens)
 		}
@@ -433,6 +437,12 @@ func reqAiInfoGen(reqLog *bfe_access_pb3.RequestLog, req *bfe_basic.Request, res
 		}
 		if usage.ImageCount > 0 {
 			reqLog.AiImageCount = proto.Int64(usage.ImageCount)
+		}
+		if usage.ImageInputTokens > 0 {
+			reqLog.AiImageInputTokens = proto.Int64(usage.ImageInputTokens)
+		}
+		if usage.VideoCount > 0 {
+			reqLog.AiVideoCount = proto.Int64(usage.VideoCount)
 		}
 		if usage.UsedCost > 0 {
 			reqLog.AiCostValue = proto.Int64(usage.UsedCost)

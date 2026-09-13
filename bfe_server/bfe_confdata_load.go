@@ -32,6 +32,7 @@ import (
 	"github.com/bfenetworks/bfe/bfe_config/bfe_tls_conf/server_cert_conf"
 	"github.com/bfenetworks/bfe/bfe_config/bfe_tls_conf/session_ticket_key_conf"
 	"github.com/bfenetworks/bfe/bfe_config/bfe_tls_conf/tls_rule_conf"
+	modelprotocol "github.com/bfenetworks/bfe/bfe_model_protocol"
 	"github.com/bfenetworks/bfe/bfe_route"
 	"github.com/bfenetworks/bfe/bfe_util/bns"
 )
@@ -49,6 +50,11 @@ func (srv *BfeServer) InitDataLoad() error {
 	srv.ServerConf = serverConf
 	srv.ReverseProxy.setTransports(srv.ServerConf.ClusterTable.ClusterMap())
 	log.Logger.Info("init serverDataConf success")
+
+	// validate AIConf.ModelProtocols against known model protocols
+	if err := validateClusterModelProtocols(serverConf); err != nil {
+		return fmt.Errorf("InitDataLoad():validateClusterModelProtocols Error %s", err)
+	}
 
 	// load bal table
 	if err := srv.balTable.Init(srv.Config.Server.GslbConf,
@@ -75,13 +81,28 @@ func (srv *BfeServer) InitDataLoad() error {
 	return nil
 }
 
-func joinPath(path, suffix string) string {
-	words := strings.Split(suffix, "/")
-	if len(words) == 0 {
-		return ""
+// validateClusterModelProtocols checks that every cluster's
+// AIConf.ModelProtocols contains only protocols known to the model-protocol
+// registry. An empty list is valid (defaults to ["openai"]).
+func validateClusterModelProtocols(serverConf *bfe_route.ServerDataConf) error {
+	if serverConf == nil || serverConf.ClusterTable == nil {
+		return nil
 	}
+	for clusterName, cluster := range serverConf.ClusterTable.ClusterMap() {
+		if cluster == nil || cluster.AIConf == nil {
+			continue
+		}
+		if err := modelprotocol.ValidateProtocols(cluster.AIConf.ModelProtocols); err != nil {
+			return fmt.Errorf("cluster %s: %s", clusterName, err)
+		}
+	}
+	return nil
+}
 
-	return filepath.Join(path, words[len(words)-1])
+func joinPath(path, suffix string) string {
+	// filepath.Base splits on os.PathSeparator; on Windows it accepts both
+	// '/' and '\\', unlike a literal strings.Split(suffix, "/").
+	return filepath.Join(path, filepath.Base(suffix))
 }
 
 // ServerDataConfReload reloads host/route/cluster conf
@@ -106,6 +127,13 @@ func (srv *BfeServer) serverDataConfReload(hostFile, vipFile, routeFile, cluster
 	newServerConf, err := bfe_route.LoadServerDataConf(hostFile, vipFile, routeFile, clusterConfFile)
 	if err != nil {
 		log.Logger.Error("ServerDataConfReload():bfe_route.LoadServerDataConf: %s", err)
+		return err
+	}
+
+	// validate AIConf.ModelProtocols against known model protocols before
+	// swapping in the new config
+	if err := validateClusterModelProtocols(newServerConf); err != nil {
+		log.Logger.Error("ServerDataConfReload():validateClusterModelProtocols: %s", err)
 		return err
 	}
 
@@ -199,15 +227,29 @@ func (srv *BfeServer) TLSConfReload(query url.Values) error {
 	// reload tls conf
 	certConfFile := srv.Config.HttpsBasic.ServerCertConf
 	tlsRuleFile := srv.Config.HttpsBasic.TlsRuleConf
+	clientCABaseDir := srv.Config.HttpsBasic.ClientCABaseDir
+	clientCRLBaseDir := srv.Config.HttpsBasic.ClientCRLBaseDir
 	if path := query.Get("path"); path != "" {
 		certConfFile = joinPath(path, certConfFile)
 		tlsRuleFile = joinPath(path, tlsRuleFile)
+
+		// Relocate client CA / CRL base dirs to the versioned config dir as
+		// well, so a reload with "path" reads a self-contained config unit.
+		// Custom base dirs outside tls_conf are left untouched.
+		tlsConfRoot := filepath.Join(srv.ConfRoot, "tls_conf")
+		if strings.HasPrefix(clientCABaseDir, tlsConfRoot+string(filepath.Separator)) {
+			clientCABaseDir = joinPath(path, clientCABaseDir)
+		}
+		if strings.HasPrefix(clientCRLBaseDir, tlsConfRoot+string(filepath.Separator)) {
+			clientCRLBaseDir = joinPath(path, clientCRLBaseDir)
+		}
 	}
 
-	return srv.tlsConfLoad(certConfFile, tlsRuleFile)
+	return srv.tlsConfLoad(certConfFile, tlsRuleFile, clientCABaseDir, clientCRLBaseDir)
 }
 
-func (srv *BfeServer) tlsConfLoad(certConfFile string, tlsRuleFile string) error {
+func (srv *BfeServer) tlsConfLoad(certConfFile string, tlsRuleFile string,
+	clientCABaseDir string, clientCRLBaseDir string) error {
 	// load certificate conf
 	certConf, err := server_cert_conf.ServerCertConfLoad(certConfFile, srv.ConfRoot)
 	if err != nil {
@@ -227,14 +269,12 @@ func (srv *BfeServer) tlsConfLoad(certConfFile string, tlsRuleFile string) error
 	}
 
 	// load client CA certificates
-	clientCABaseDir := srv.Config.HttpsBasic.ClientCABaseDir
 	clientCAMap, err := tls_rule_conf.ClientCALoad(tlsRule.Config, clientCABaseDir)
 	if err != nil {
 		return fmt.Errorf("in ClientCALoad() :%s", err.Error())
 	}
 
 	// load client cert CRL
-	clientCRLBaseDir := srv.Config.HttpsBasic.ClientCRLBaseDir
 	clientCRLPoolMap, err := tls_rule_conf.ClientCRLLoad(clientCAMap, clientCRLBaseDir)
 	if err != nil {
 		return fmt.Errorf("in ClientCRLLoad(): %s", err.Error())

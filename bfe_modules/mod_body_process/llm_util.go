@@ -26,22 +26,34 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+import (
+	modelprotocol "github.com/bfenetworks/bfe/bfe_model_protocol"
+	"github.com/bfenetworks/bfe/bfe_model_protocol/utils"
+)
+
 const UnknownModel = "unknown"
 
 type QuotaUsage struct {
 	//return from reponse
-	PromptTokens      int64 // number of tokens in the prompt
-	CompletionTokens  int64 // number of tokens in the completion
-	CacheReadTokens   int64 // usage.cache_read_tokens, already included in PromptTokens
-	CacheWriteTokens  int64 // usage.cache_write_tokens, independent add-on item
-	AudioInputTokens  int64 // usage.audio_input_tokens, already included in PromptTokens
-	AudioOutputTokens int64 // usage.audio_output_tokens, already included in CompletionTokens
-	ImageCount        int64 // number of generated images for image generation models
-	UsedQuota         int64 // used quota for this request
+	PromptTokens       int64 // number of tokens in the prompt
+	CompletionTokens   int64 // number of tokens in the completion
+	CacheReadTokens    int64 // usage.cache_read_tokens, already included in PromptTokens
+	CacheWriteTokens   int64 // usage.cache_write_tokens, already included in PromptTokens (normalized for Anthropic)
+	CacheWriteTokens1h int64 // 1h-TTL cache write tokens (usage.cache_creation.ephemeral_1h_input_tokens), already included in CacheWriteTokens
+	AudioInputTokens   int64 // usage.audio_input_tokens, already included in PromptTokens
+	AudioOutputTokens  int64 // usage.audio_output_tokens, already included in CompletionTokens
+	ImageInputTokens   int64 // usage.image_input_tokens / input_token_details.image_tokens, already included in PromptTokens
+	VideoCount         int64 // number of generated videos for video generation models
+	ImageCount         int64 // number of generated images for image generation models
+	UsedQuota          int64 // used quota for this request
 
 	//estimate for current response
 	CurrentTokens int64 //effect when IsGuess is true
 	IsGuess       bool  //true = is estimate
+
+	//response completion status (issue #1352)
+	IsFinalUsage  bool //true = this event carries the final usage of the response
+	IsTermination bool //true = this event terminates the response stream (message_stop, [DONE])
 }
 
 type SSEEvent struct {
@@ -120,62 +132,52 @@ func (e *SSEEvent) GetAuditData() []byte {
 	return e.GetData()
 }
 
-func (e *SSEEvent) GetQuotaUsage() QuotaUsage {
+func (e *SSEEvent) GetQuotaUsage(authStyle string) QuotaUsage {
 	data := e.GetData()
-	used := gjson.GetBytes(data, "usage.total_tokens").Int()
-	prompt := gjson.GetBytes(data, "usage.prompt_tokens").Int()
-	completion := gjson.GetBytes(data, "usage.completion_tokens").Int()
-	cacheRead := gjson.GetBytes(data, "usage.cache_read_tokens").Int()
-	cacheWrite := gjson.GetBytes(data, "usage.cache_write_tokens").Int()
-	audioInput := gjson.GetBytes(data, "usage.audio_input_tokens").Int()
-	audioOutput := gjson.GetBytes(data, "usage.audio_output_tokens").Int()
-	imageCount := gjson.GetBytes(data, "usage.image_count").Int()
-	if imageCount == 0 {
-		imageCount = gjson.GetBytes(data, "data.#").Int()
-	}
-
-	// DeepSeek fallback: prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens
-	if cacheRead == 0 {
-		cacheRead = gjson.GetBytes(data, "usage.prompt_cache_hit_tokens").Int()
-	}
-	if cacheRead == 0 {
-		cacheRead = gjson.GetBytes(data, "usage.prompt_tokens_details.cached_tokens").Int()
-	}
-
-	// Claude fallback: input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens
-	if prompt == 0 && completion == 0 {
-		prompt = gjson.GetBytes(data, "usage.input_tokens").Int()
-		completion = gjson.GetBytes(data, "usage.output_tokens").Int()
-		if cacheRead == 0 {
-			cacheRead = gjson.GetBytes(data, "usage.cache_read_input_tokens").Int()
-		}
-		if cacheWrite == 0 {
-			cacheWrite = gjson.GetBytes(data, "usage.cache_creation_input_tokens").Int()
-		}
-		if used == 0 {
-			used = prompt + completion
-		}
-	}
+	fields := utils.ParseUsageFieldsCrossProtocol(data)
 
 	curtoken := int64(0)
 	isguess := true
-	if used > 0 || imageCount > 0 {
+	if fields.UsedQuota > 0 || fields.ImageCount > 0 || fields.VideoCount > 0 {
 		isguess = false
 	} else {
 		curtoken = EstimateContentToken(string(data))
 	}
 
+	// Detect stream termination and final usage (issue #1352) via the
+	// protocol adapter for the detected auth style. The per-protocol
+	// rules (formerly hard-coded here: Anthropic streams end with
+	// message_stop and deliver the final usage in the preceding
+	// message_delta; OpenAI streams end with [DONE] and may carry the
+	// final usage in the last chunk) moved into the adapters verbatim, so
+	// openai/anthropic semantics are unchanged; protocols without an SSE
+	// termination event (gemini) plug in here instead of never
+	// terminating.
+	evType := gjson.GetBytes(data, "type").String()
+	streamEv := utils.StreamEvent{Type: evType, Data: string(data)}
+	adapter := modelprotocol.Get(authStyle)
+	isTermination := adapter.IsStreamTerminal(streamEv)
+	isFinalUsage := false
+	if !isguess && fields.CompletionTokens > 0 {
+		isFinalUsage = adapter.IsFinalUsageEvent(streamEv)
+	}
+
 	return QuotaUsage{
-		PromptTokens:      prompt,
-		CompletionTokens:  completion,
-		CacheReadTokens:   cacheRead,
-		CacheWriteTokens:  cacheWrite,
-		AudioInputTokens:  audioInput,
-		AudioOutputTokens: audioOutput,
-		ImageCount:        imageCount,
-		UsedQuota:         used,
-		CurrentTokens:     curtoken,
-		IsGuess:           isguess,
+		PromptTokens:       fields.PromptTokens,
+		CompletionTokens:   fields.CompletionTokens,
+		CacheReadTokens:    fields.CacheReadTokens,
+		CacheWriteTokens:   fields.CacheWriteTokens,
+		CacheWriteTokens1h: fields.CacheWriteTokens1h,
+		AudioInputTokens:   fields.AudioInputTokens,
+		AudioOutputTokens:  fields.AudioOutputTokens,
+		ImageInputTokens:   fields.ImageInputTokens,
+		VideoCount:         fields.VideoCount,
+		ImageCount:         fields.ImageCount,
+		UsedQuota:          fields.UsedQuota,
+		CurrentTokens:      curtoken,
+		IsGuess:            isguess,
+		IsFinalUsage:       isFinalUsage,
+		IsTermination:      isTermination,
 	}
 }
 
@@ -316,6 +318,9 @@ func remarshal(src any, dst any) error {
 	return json.Unmarshal(b, dst)
 }
 
+// EstimateContentToken estimates the token count of a response body chunk
+// (roughly 4 bytes per token). The implementation lives in
+// bfe_model_protocol/utils and is kept re-exported here for compatibility.
 func EstimateContentToken(val string) int64 {
-	return int64(len(val)) / 4
+	return utils.EstimateContentToken(val)
 }

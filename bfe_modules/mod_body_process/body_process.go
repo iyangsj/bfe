@@ -21,9 +21,12 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/bfenetworks/bfe/bfe_basic"
 	"github.com/bfenetworks/bfe/bfe_http"
-	"github.com/tidwall/gjson"
+	modelprotocol "github.com/bfenetworks/bfe/bfe_model_protocol"
+	"github.com/bfenetworks/bfe/bfe_model_protocol/utils"
 )
 
 // BodyProcessor 扩展中断支持
@@ -91,7 +94,11 @@ type Event interface {
 	// GetData() []byte
 	ToBytes() []byte // 转换为字节数组
 
-	GetQuotaUsage() QuotaUsage
+	// GetQuotaUsage extracts the quota usage of this event. authStyle is
+	// the detected protocol/auth style of the request; it selects the
+	// protocol adapter that decides stream termination and the final
+	// usage event (unknown styles fall back to the openai adapter).
+	GetQuotaUsage(authStyle string) QuotaUsage
 }
 
 type EventDecoder interface {
@@ -419,62 +426,48 @@ func (e *RawEvent) ToBytes() []byte {
 	return *e
 }
 
-func (e *RawEvent) GetQuotaUsage() QuotaUsage {
+func (e *RawEvent) GetQuotaUsage(authStyle string) QuotaUsage {
+	data := *e
+	fields := utils.ParseUsageFieldsCrossProtocol(data)
+
 	curtoken := int64(0)
 	isguess := true
-
-	used := gjson.GetBytes(*e, "usage.total_tokens").Int()
-	prompt := gjson.GetBytes(*e, "usage.prompt_tokens").Int()
-	completion := gjson.GetBytes(*e, "usage.completion_tokens").Int()
-	cacheRead := gjson.GetBytes(*e, "usage.cache_read_tokens").Int()
-	cacheWrite := gjson.GetBytes(*e, "usage.cache_write_tokens").Int()
-	audioInput := gjson.GetBytes(*e, "usage.audio_input_tokens").Int()
-	audioOutput := gjson.GetBytes(*e, "usage.audio_output_tokens").Int()
-	imageCount := gjson.GetBytes(*e, "usage.image_count").Int()
-	if imageCount == 0 {
-		imageCount = gjson.GetBytes(*e, "data.#").Int()
-	}
-
-	// DeepSeek fallback: prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens
-	if cacheRead == 0 {
-		cacheRead = gjson.GetBytes(*e, "usage.prompt_cache_hit_tokens").Int()
-	}
-	if cacheRead == 0 {
-		cacheRead = gjson.GetBytes(*e, "usage.prompt_tokens_details.cached_tokens").Int()
-	}
-
-	// Claude fallback: input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens
-	if prompt == 0 && completion == 0 {
-		prompt = gjson.GetBytes(*e, "usage.input_tokens").Int()
-		completion = gjson.GetBytes(*e, "usage.output_tokens").Int()
-		if cacheRead == 0 {
-			cacheRead = gjson.GetBytes(*e, "usage.cache_read_input_tokens").Int()
-		}
-		if cacheWrite == 0 {
-			cacheWrite = gjson.GetBytes(*e, "usage.cache_creation_input_tokens").Int()
-		}
-		if used == 0 {
-			used = prompt + completion
-		}
-	}
-
-	if used > 0 || imageCount > 0 {
+	if fields.UsedQuota > 0 || fields.ImageCount > 0 || fields.VideoCount > 0 {
 		isguess = false
 	} else {
-		curtoken = EstimateContentToken(string(*e))
+		curtoken = EstimateContentToken(string(data))
 	}
 
+	// Non-SSE payloads carry no SSE envelope: a whole-body JSON (or the
+	// usage-bearing line of an ndjson payload) that parses to a non-guess
+	// usage marks both the final usage and the response completion
+	// (issue #1364). The event-type decision lives in the protocol
+	// adapter for the detected auth style, same as the SSE path.
+	streamEv := utils.StreamEvent{
+		Type: gjson.GetBytes(data, "type").String(),
+		Data: string(data),
+	}
+	adapter := modelprotocol.Get(authStyle)
+	isFinalUsage := !isguess && fields.CompletionTokens > 0 &&
+		adapter.IsFinalUsageEvent(streamEv)
+	isTermination := isFinalUsage
+
 	return QuotaUsage{
-		PromptTokens:      prompt,
-		CompletionTokens:  completion,
-		CacheReadTokens:   cacheRead,
-		CacheWriteTokens:  cacheWrite,
-		AudioInputTokens:  audioInput,
-		AudioOutputTokens: audioOutput,
-		ImageCount:        imageCount,
-		UsedQuota:         used,
-		CurrentTokens:     curtoken,
-		IsGuess:           isguess,
+		PromptTokens:       fields.PromptTokens,
+		CompletionTokens:   fields.CompletionTokens,
+		CacheReadTokens:    fields.CacheReadTokens,
+		CacheWriteTokens:   fields.CacheWriteTokens,
+		CacheWriteTokens1h: fields.CacheWriteTokens1h,
+		AudioInputTokens:   fields.AudioInputTokens,
+		AudioOutputTokens:  fields.AudioOutputTokens,
+		ImageInputTokens:   fields.ImageInputTokens,
+		VideoCount:         fields.VideoCount,
+		ImageCount:         fields.ImageCount,
+		UsedQuota:          fields.UsedQuota,
+		CurrentTokens:      curtoken,
+		IsGuess:            isguess,
+		IsFinalUsage:       isFinalUsage,
+		IsTermination:      isTermination,
 	}
 }
 
