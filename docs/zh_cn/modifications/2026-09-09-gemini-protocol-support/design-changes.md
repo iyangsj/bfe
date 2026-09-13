@@ -139,7 +139,7 @@ IsStreamTerminal(ev *SSEEvent) bool
 IsFinalUsageEvent(ev *SSEEvent) bool
 ```
 
-- openai 适配器承载现有 `type=="message_stop" || data=="[DONE]"` 逻辑；anthropic 适配器承载 `message_delta` / `message` 逻辑——**行为逐行搬迁，零变化**；
+- openai 适配器承载现有 `type=="message_stop" || data=="[DONE]"` 逻辑；anthropic 适配器承载 `message_delta` / `message` 逻辑——**anthropic 行为逐行搬迁；openai 在搬迁时遗漏 `message_delta`，导致跨协议流（Bearer 请求 + Anthropic 响应体）丢失最终 usage（SC12 TC02/TC03 回归），已于 2026-09-13 在 openai 适配器补回**；
 - gemini 适配器：`IsStreamTerminal` 恒 false（HTTP 流结束即终止，由现有 EOF 路径兜底）；`IsFinalUsageEvent` 按事件 data 中是否含 `usageMetadata` 判定；
 - 调用点（`GetQuotaUsage` 及其在 body_process 中的事件侧调用）改为经 `modelprotocol.Get(authStyle)` 取判定。
 

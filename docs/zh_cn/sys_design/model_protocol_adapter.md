@@ -103,7 +103,9 @@ type ProtocolAdapter interface {
     IsStreamTerminal(ev StreamEvent) bool
 
     // IsFinalUsageEvent 判定一个流式事件是否携带最终 usage
-    //（openai: type=="message" 或空 type（协议无关最终 usage chunk）；
+    //（openai: message_delta / type=="message" 或空 type（协议无关最终 usage chunk；
+    //  message_delta 为跨协议兜底——Bearer 请求识别为 openai 而后端返回 Anthropic
+    //  流时，最终 usage 仅随 message_delta 到达，缺此判定会少计/免计，SC12 回归）；
     //  anthropic: message_delta / message / 空 type（message_start 初始 usage 不计）；
     //  gemini 每个 chunk 均带累积 usageMetadata，仅最后一个含 usage 的 chunk 计为最终，
     //  防止计费取中间累积值导致少计）
@@ -181,7 +183,7 @@ http_conn.serveRequest()
 | 版本头注入 | `reverseproxy.go` 硬编码 `anthropic-version` | 适配器 `ExtraHeaders`，显式携带优先（TC-07） |
 | 协议校验 | `clusterSupportsAuthStyle` | `modelprotocol.Supports`（语义不变） |
 | 流式 usage | `SSEEvent/RawEvent.GetQuotaUsage` 各一份全链 | 适配器字段链 + 调用方累加语义保留 |
-| 流式终止/最终 usage 判定 | `llm_util.go` 硬编码 `message_stop` / `[DONE]` / `message_delta` | 适配器 `IsStreamTerminal` / `IsFinalUsageEvent`；openai/anthropic 逐行搬迁，gemini 无终止事件由流 EOF 兜底（2026-09-09 随 gemini 接入下沉） |
+| 流式终止/最终 usage 判定 | `llm_util.go` 硬编码 `message_stop` / `[DONE]` / `message_delta` | 适配器 `IsStreamTerminal` / `IsFinalUsageEvent`；anthropic 逐行搬迁，openai 在搬迁遗漏 message_delta 后已于 2026-09-13 补回（跨协议兜底），gemini 无终止事件由流 EOF 兜底（2026-09-09 随 gemini 接入下沉） |
 | 非流式 usage | `UpdateCtxByUsage` 一份全链 | 按 `AuthStyle` 取单适配器；结果全零时回退两阶段组合（issue #1364） |
 | fallback 判定 | `shouldTriggerFallback` 纯状态码白名单 | 前置 `ErrorNormalizer` seam（默认返回 nil → 白名单，行为不变） |
 
